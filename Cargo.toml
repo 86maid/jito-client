@@ -2,6 +2,22 @@
 name = "jito-client"
 version = "0.1.0"
 edition = "2024"
+authors = ["86maid"]
+license = "MIT"
+repository = "https://github.com/86maid/jito-client"
+keywords = [
+  "jito",
+  "client",
+  "ip",
+  "tip",
+  "solana",
+  "load-balancer",
+  "balancer",
+  "async",
+  "reqwest",
+  "tokio",
+]
+categories = ["network-programming", "asynchronous"]
 
 [dependencies]
 anyhow = "1.0.0"
