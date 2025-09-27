@@ -13,9 +13,9 @@ pub use reqwest;
 pub struct JitoClientBuilder {
     url: Vec<String>,
     rate: u64,
-    mutil_ipv4: bool,
-    mutil_ipv6: bool,
-    mutil_ip: bool,
+    multi_ipv4: bool,
+    multi_ipv6: bool,
+    multi_ip: bool,
     broadcast: bool,
     timeout: Option<Duration>,
     proxy: Option<Proxy>,
@@ -29,9 +29,9 @@ impl JitoClientBuilder {
         Self {
             url: vec!["https://mainnet.block-engine.jito.wtf".to_string()],
             rate: 0,
-            mutil_ipv4: false,
-            mutil_ipv6: false,
-            mutil_ip: false,
+            multi_ipv4: false,
+            multi_ipv6: false,
+            multi_ip: false,
             broadcast: false,
             timeout: None,
             proxy: None,
@@ -54,19 +54,19 @@ impl JitoClientBuilder {
 
     /// Enables sending requests via multiple IPv4 addresses.
     pub fn multi_ipv4(mut self, mutil_ip: bool) -> Self {
-        self.mutil_ipv4 = mutil_ip;
+        self.multi_ipv4 = mutil_ip;
         self
     }
 
     /// Enables sending requests via multiple IPv6 addresses.
     pub fn multi_ipv6(mut self, mutil_ip: bool) -> Self {
-        self.mutil_ipv6 = mutil_ip;
+        self.multi_ipv6 = mutil_ip;
         self
     }
 
     /// Enables sending requests via multiple IPs (both IPv4 and IPv6).
     pub fn multi_ip(mut self, mutil_ip: bool) -> Self {
-        self.mutil_ip = mutil_ip;
+        self.multi_ip = mutil_ip;
         self
     }
 
@@ -108,23 +108,23 @@ impl JitoClientBuilder {
             Duration::from_millis(1000).div_f64(self.rate as f64)
         };
 
-        if self.mutil_ipv4 {
+        if self.multi_ipv4 {
             self.ip.extend(load_balancer::ip::get_ipv4_list());
         }
 
-        if self.mutil_ipv6 {
+        if self.multi_ipv6 {
             self.ip.extend(load_balancer::ip::get_ipv6_list());
         }
 
-        if self.mutil_ip {
-            if self.mutil_ipv4 || self.mutil_ipv6 {
+        if self.multi_ip {
+            if self.multi_ipv4 || self.multi_ipv6 {
                 bail!("`mutil_ip` is mutually exclusive with `mutil_ipv4`/`mutil_ipv6`");
             }
 
             self.ip.extend(load_balancer::ip::get_ip_list());
         }
 
-        let local = !self.mutil_ipv4 && !self.mutil_ipv6 && !self.mutil_ip;
+        let local = !self.multi_ipv4 && !self.multi_ipv6 && !self.multi_ip;
 
         if !local {
             if self.ip.is_empty() {
