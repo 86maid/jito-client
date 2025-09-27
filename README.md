@@ -30,7 +30,6 @@ async fn main() {
   let bid = client.send_bundle_bid(&["tx"]).await.unwrap();
   println!("{:?}", bid);
 }
-
 ```
 
 ### Customized
