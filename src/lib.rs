@@ -261,7 +261,7 @@ impl JitoClient {
 
                 Ok(futures::future::select_ok(url.iter().map(|v| {
                     client
-                        .post(v)
+                        .post(&format!("{}/api/v1/transactions", v))
                         .query(&["bundleOnly", "true"])
                         .json(&body)
                         .send()
@@ -273,7 +273,7 @@ impl JitoClient {
                 let (ref url, ref client) = *v.alloc().await;
 
                 Ok(client
-                    .post(url)
+                    .post(&format!("{}/api/v1/transactions", url))
                     .query(&["bundleOnly", "true"])
                     .json(&body)
                     .send()
@@ -314,16 +314,23 @@ impl JitoClient {
             JitoClientRef::Broadcast(ref v) => {
                 let (ref url, ref client) = *v.alloc().await;
 
-                Ok(futures::future::select_ok(
-                    url.iter().map(|v| client.post(v).json(&body).send()),
-                )
+                Ok(futures::future::select_ok(url.iter().map(|v| {
+                    client
+                        .post(&format!("{}/api/v1/transactions", v))
+                        .json(&body)
+                        .send()
+                }))
                 .await?
                 .0)
             }
             JitoClientRef::LB(ref v) => {
                 let (ref url, ref client) = *v.alloc().await;
 
-                Ok(client.post(url).json(&body).send().await?)
+                Ok(client
+                    .post(&format!("{}/api/v1/transactions", url))
+                    .json(&body)
+                    .send()
+                    .await?)
             }
         }
     }
@@ -336,9 +343,10 @@ impl JitoClient {
         let data = tx
             .into_iter()
             .map(|tx| {
-                let raw = bincode::serialize(&tx)
-                    .map_err(|e| anyhow::anyhow!("failed to serialize tx: {}", e))?;
-                Ok(BASE64_STANDARD.encode(raw))
+                Ok(BASE64_STANDARD.encode(
+                    bincode::serialize(&tx)
+                        .map_err(|v| anyhow::anyhow!("failed to serialize tx: {}", v))?,
+                ))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
 
@@ -353,9 +361,9 @@ impl JitoClient {
             JitoClientRef::Broadcast(ref v) => {
                 let (ref urls, ref client) = *v.alloc().await;
 
-                Ok(futures::future::select_ok(urls.iter().map(|u| {
+                Ok(futures::future::select_ok(urls.iter().map(|v| {
                     client
-                        .post(&format!("{}/api/v1/bundles", u))
+                        .post(&format!("{}/api/v1/bundles", v))
                         .json(&body)
                         .send()
                 }))
@@ -384,7 +392,7 @@ impl JitoClient {
             .json::<serde_json::Value>()
             .await?["result"]
             .as_str()
-            .map(|s| s.to_string())
+            .map(|v| v.to_string())
             .ok_or_else(|| anyhow::anyhow!("missing bundle result"))
     }
 }
