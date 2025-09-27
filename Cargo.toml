@@ -18,6 +18,7 @@ keywords = [
   "tokio",
 ]
 categories = ["network-programming", "asynchronous"]
+description = "A Rust client for interacting with the Jito network, supporting **rate limiting**, **multi-IP usage**, and **broadcasting requests** to multiple endpoints."
 
 [dependencies]
 anyhow = "1.0.0"
