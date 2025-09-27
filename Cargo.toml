@@ -5,18 +5,7 @@ edition = "2024"
 authors = ["86maid"]
 license = "MIT"
 repository = "https://github.com/86maid/jito-client"
-keywords = [
-  "jito",
-  "client",
-  "ip",
-  "tip",
-  "solana",
-  "load-balancer",
-  "balancer",
-  "async",
-  "reqwest",
-  "tokio",
-]
+keywords = ["jito", "client", "solana", "load-balancer", "balancer"]
 categories = ["network-programming", "asynchronous"]
 description = "A Rust client for interacting with the Jito network, supporting **rate limiting**, **multi-IP usage**, and **broadcasting requests** to multiple endpoints."
 
