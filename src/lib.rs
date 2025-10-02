@@ -1,6 +1,10 @@
 use anyhow::{Context, anyhow, bail};
 use base64::prelude::*;
-use load_balancer::{LoadBalancer, interval::IntervalLoadBalancer};
+use load_balancer::{
+    LoadBalancer,
+    interval::IntervalLoadBalancer,
+    ip::{get_ip_list, get_ipv4_list, get_ipv6_list},
+};
 use reqwest::{Client, ClientBuilder, Proxy, Response, header::HeaderMap};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -53,20 +57,20 @@ impl JitoClientBuilder {
     }
 
     /// Enables sending requests via multiple IPv4 addresses.
-    pub fn multi_ipv4(mut self, mutil_ip: bool) -> Self {
-        self.multi_ipv4 = mutil_ip;
+    pub fn multi_ipv4(mut self, multi_ip: bool) -> Self {
+        self.multi_ipv4 = multi_ip;
         self
     }
 
     /// Enables sending requests via multiple IPv6 addresses.
-    pub fn multi_ipv6(mut self, mutil_ip: bool) -> Self {
-        self.multi_ipv6 = mutil_ip;
+    pub fn multi_ipv6(mut self, multi_ip: bool) -> Self {
+        self.multi_ipv6 = multi_ip;
         self
     }
 
     /// Enables sending requests via multiple IPs (both IPv4 and IPv6).
-    pub fn multi_ip(mut self, mutil_ip: bool) -> Self {
-        self.multi_ip = mutil_ip;
+    pub fn multi_ip(mut self, multi_ip: bool) -> Self {
+        self.multi_ip = multi_ip;
         self
     }
 
@@ -118,7 +122,7 @@ impl JitoClientBuilder {
 
         if self.multi_ip {
             if self.multi_ipv4 || self.multi_ipv6 {
-                bail!("`mutil_ip` is mutually exclusive with `mutil_ipv4`/`mutil_ipv6`");
+                bail!("`multi_ip` is mutually exclusive with `multi_ipv4`/`multi_ipv6`");
             }
 
             self.ip.extend(load_balancer::ip::get_ip_list());
@@ -126,10 +130,8 @@ impl JitoClientBuilder {
 
         let local = !self.multi_ipv4 && !self.multi_ipv6 && !self.multi_ip;
 
-        if !local {
-            if self.ip.is_empty() {
-                bail!("local ip is empty");
-            }
+        if !local && self.ip.is_empty() {
+            bail!("local ip is empty");
         }
 
         let inner = if self.broadcast {
@@ -173,26 +175,31 @@ impl JitoClientBuilder {
                 }
             }
 
-            JitoClientRef::Broadcast(IntervalLoadBalancer::new(entries))
+            JitoClientRef {
+                broadcast: true,
+                lb: IntervalLoadBalancer::new(entries),
+            }
         } else {
             let mut entries = Vec::new();
 
             if local {
-                let mut cb = ClientBuilder::new();
+                for url in &self.url {
+                    let mut cb = ClientBuilder::new();
 
-                if let Some(v) = self.timeout {
-                    cb = cb.timeout(v);
+                    if let Some(v) = self.timeout {
+                        cb = cb.timeout(v);
+                    }
+
+                    if let Some(v) = self.proxy.clone() {
+                        cb = cb.proxy(v);
+                    }
+
+                    if let Some(v) = self.headers.clone() {
+                        cb = cb.default_headers(v);
+                    }
+
+                    entries.push((interval, Arc::new((vec![url.clone()], cb.build()?))));
                 }
-
-                if let Some(v) = self.proxy {
-                    cb = cb.proxy(v);
-                }
-
-                if let Some(v) = self.headers {
-                    cb = cb.default_headers(v);
-                }
-
-                entries.push((interval, Arc::new((self.url[0].clone(), cb.build()?))));
             } else {
                 for url in &self.url {
                     for ip in &self.ip {
@@ -212,12 +219,15 @@ impl JitoClientBuilder {
 
                         cb = cb.local_address(*ip);
 
-                        entries.push((interval, Arc::new((url.clone(), cb.build()?))));
+                        entries.push((interval, Arc::new((vec![url.clone()], cb.build()?))));
                     }
                 }
             }
 
-            JitoClientRef::LB(IntervalLoadBalancer::new(entries))
+            JitoClientRef {
+                broadcast: false,
+                lb: IntervalLoadBalancer::new(entries),
+            }
         };
 
         Ok(JitoClient {
@@ -226,9 +236,9 @@ impl JitoClientBuilder {
     }
 }
 
-enum JitoClientRef {
-    Broadcast(IntervalLoadBalancer<Arc<(Vec<String>, Client)>>),
-    LB(IntervalLoadBalancer<Arc<(String, Client)>>),
+struct JitoClientRef {
+    broadcast: bool,
+    lb: IntervalLoadBalancer<Arc<(Vec<String>, Client)>>,
 }
 
 /// Jito client for sending transactions and bundles.
@@ -255,30 +265,25 @@ impl JitoClient {
             ]
         });
 
-        match *self.inner {
-            JitoClientRef::Broadcast(ref v) => {
-                let (ref url, ref client) = *v.alloc().await;
+        let (ref url, ref client) = *self.inner.lb.alloc().await;
 
-                Ok(futures::future::select_ok(url.iter().map(|v| {
-                    client
-                        .post(&format!("{}/api/v1/transactions", v))
-                        .query(&["bundleOnly", "true"])
-                        .json(&body)
-                        .send()
-                }))
-                .await?
-                .0)
-            }
-            JitoClientRef::LB(ref v) => {
-                let (ref url, ref client) = *v.alloc().await;
-
-                Ok(client
-                    .post(&format!("{}/api/v1/transactions", url))
+        if self.inner.broadcast {
+            Ok(futures::future::select_ok(url.iter().map(|v| {
+                client
+                    .post(&format!("{}/api/v1/transactions", v))
                     .query(&["bundleOnly", "true"])
                     .json(&body)
                     .send()
-                    .await?)
-            }
+            }))
+            .await?
+            .0)
+        } else {
+            Ok(client
+                .post(&format!("{}/api/v1/transactions", url[0]))
+                .query(&["bundleOnly", "true"])
+                .json(&body)
+                .send()
+                .await?)
         }
     }
 
@@ -310,28 +315,23 @@ impl JitoClient {
             ]
         });
 
-        match *self.inner {
-            JitoClientRef::Broadcast(ref v) => {
-                let (ref url, ref client) = *v.alloc().await;
+        let (ref url, ref client) = *self.inner.lb.alloc().await;
 
-                Ok(futures::future::select_ok(url.iter().map(|v| {
-                    client
-                        .post(&format!("{}/api/v1/transactions", v))
-                        .json(&body)
-                        .send()
-                }))
-                .await?
-                .0)
-            }
-            JitoClientRef::LB(ref v) => {
-                let (ref url, ref client) = *v.alloc().await;
-
-                Ok(client
-                    .post(&format!("{}/api/v1/transactions", url))
+        if self.inner.broadcast {
+            Ok(futures::future::select_ok(url.iter().map(|v| {
+                client
+                    .post(&format!("{}/api/v1/transactions", v))
                     .json(&body)
                     .send()
-                    .await?)
-            }
+            }))
+            .await?
+            .0)
+        } else {
+            Ok(client
+                .post(&format!("{}/api/v1/transactions", url[0]))
+                .json(&body)
+                .send()
+                .await?)
         }
     }
 
@@ -357,28 +357,23 @@ impl JitoClient {
             "params": [ data, { "encoding": "base64" } ]
         });
 
-        match *self.inner {
-            JitoClientRef::Broadcast(ref v) => {
-                let (ref urls, ref client) = *v.alloc().await;
+        let (ref url, ref client) = *self.inner.lb.alloc().await;
 
-                Ok(futures::future::select_ok(urls.iter().map(|v| {
-                    client
-                        .post(&format!("{}/api/v1/bundles", v))
-                        .json(&body)
-                        .send()
-                }))
-                .await?
-                .0)
-            }
-            JitoClientRef::LB(ref v) => {
-                let (ref url, ref client) = *v.alloc().await;
-
-                Ok(client
-                    .post(&format!("{}/api/v1/bundles", url))
+        if self.inner.broadcast {
+            Ok(futures::future::select_ok(url.iter().map(|v| {
+                client
+                    .post(&format!("{}/api/v1/bundles", v))
                     .json(&body)
                     .send()
-                    .await?)
-            }
+            }))
+            .await?
+            .0)
+        } else {
+            Ok(client
+                .post(&format!("{}/api/v1/bundles", url[0]))
+                .json(&body)
+                .send()
+                .await?)
         }
     }
 
@@ -503,4 +498,28 @@ pub async fn get_inflight_bundle_statuses<T: IntoIterator<Item = impl AsRef<str>
         .json::<InflightRpcResponse>()
         .await?
         .result)
+}
+
+pub async fn test_ip(ip: IpAddr) -> anyhow::Result<()> {
+    reqwest::ClientBuilder::new()
+        .timeout(Duration::from_secs(3))
+        .local_address(ip)
+        .build()?
+        .get("https://crates.io")
+        .send()
+        .await?;
+
+    Ok(())
+}
+
+pub async fn test_all_ip() -> Vec<anyhow::Result<()>> {
+    futures::future::join_all(get_ip_list().into_iter().map(|v| test_ip(v))).await
+}
+
+pub async fn test_all_ipv4() -> Vec<anyhow::Result<()>> {
+    futures::future::join_all(get_ipv4_list().into_iter().map(|v| test_ip(v))).await
+}
+
+pub async fn test_all_ipv6() -> Vec<anyhow::Result<()>> {
+    futures::future::join_all(get_ipv6_list().into_iter().map(|v| test_ip(v))).await
 }
