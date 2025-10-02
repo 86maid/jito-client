@@ -1,13 +1,13 @@
 [package]
 name = "jito-client"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 authors = ["86maid"]
 license = "MIT"
 repository = "https://github.com/86maid/jito-client"
 keywords = ["jito", "client", "solana", "load-balancer", "balancer"]
 categories = ["network-programming", "asynchronous"]
-description = "A Rust client for interacting with the Jito network, supporting **rate limiting**, **multi-IP usage**, and **broadcasting requests** to multiple endpoints."
+description = "A Rust client for interacting with the Solana Jito network, supporting rate limiting, multi-IP usage, and broadcasting requests to multiple endpoints."
 
 [dependencies]
 anyhow = "1.0.0"
