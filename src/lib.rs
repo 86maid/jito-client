@@ -128,16 +128,16 @@ impl JitoClientBuilder {
             self.ip.extend(load_balancer::ip::get_ip_list());
         }
 
-        let local = !self.multi_ipv4 && !self.multi_ipv6 && !self.multi_ip;
+        let default_ip = !self.multi_ipv4 && !self.multi_ipv6 && !self.multi_ip;
 
-        if !local && self.ip.is_empty() {
+        if !default_ip && self.ip.is_empty() {
             bail!("local ip is empty");
         }
 
         let inner = if self.broadcast {
             let mut entries = Vec::new();
 
-            if local {
+            if default_ip {
                 let mut cb = ClientBuilder::new();
 
                 if let Some(v) = self.timeout {
@@ -182,7 +182,7 @@ impl JitoClientBuilder {
         } else {
             let mut entries = Vec::new();
 
-            if local {
+            if default_ip {
                 for url in &self.url {
                     let mut cb = ClientBuilder::new();
 
