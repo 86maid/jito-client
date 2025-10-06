@@ -39,10 +39,12 @@ use jito_client::*;
 
 #[tokio::main]
 async fn main() {
-  // If you have 10 IPs, this is equivalent to sending 30 requests per second
+  // If you have 1 IP, max 3 request/sec
+  // If you have 10 IPs, max 30 requests/sec
   let client = JitoClientBuilder::new()
-      // Sets the request rate limit (requests per second, 0 = unlimited)
-      .rate(1)
+      // Sets the interval duration between requests (0 = unlimited)
+      // For example, 5 requests per second = 200 ms interval
+      .interval(Duration::from_millis(1000))
       // Enables sending requests via multiple IPs
       .ip(get_ipv4_list().unwrap())
       // Sets the target URLs for the client
@@ -53,21 +55,14 @@ async fn main() {
       ])
       .build()
       .unwrap();
-}
-```
 
-### Broadcast
-
-```rust
-use jito_client::*;
-
-#[tokio::main]
-async fn main() {
-  // Each transaction/bundle sent will go to all URLs in parallel
+  // If you have 1 IP, max 1 request/sec, broadcasted to all URLs
+  // If you have 10 IPs, max 10 requests/sec, broadcasted to all URLs
   let client = JitoClientBuilder::new()
-      // Configures the client to send requests to all URLs in parallel
+      // Broadcast each request to all configured URLs
       .broadcast(true)
-      // Sets the target URLs for the client
+      .interval(Duration::from_millis(1000))
+      .ip(get_ipv4_list().unwrap())
       .url(&[
           "https://amsterdam.mainnet.block-engine.jito.wtf",
           "https://tokyo.mainnet.block-engine.jito.wtf",
@@ -75,5 +70,28 @@ async fn main() {
       ])
       .build()
       .unwrap();
+
+  let client = JitoClientBuilder::new()
+      // Sets a timeout duration for requests
+      .timeout(Duration::from_millis(5000))
+      /// Sets an header for the client
+      .headers(HeaderMap::new())
+      // Sets an proxy for the client
+      // warning: .ip(get_ipv4_list().unwrap()) must be on the same network segment as the proxy
+      // 192.168.0.2 ----X----> 127.0.0.1:7890
+      // 192.168.0.2 ---------> 192.168.0.2:7890
+      .proxy(Proxy::all("http://127.0.0.1:7890"))
+      .build()
+      .unwrap();
 }
 ```
+
+## Tip
+
+The Jito server may enforce rate limits at multiple levels: global, IP, and wallet.
+
+* **Global**: For example, the server may handle up to 10000 requests per second in total, regardless of which IP or wallet the requests come from.
+
+* **IP**: For example, each IP can make up to 5 requests per second.
+
+* **Wallet**: For example, each wallet can submit up to 5 transaction requests per second.

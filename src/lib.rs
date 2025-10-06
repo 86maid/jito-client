@@ -1,7 +1,7 @@
 use anyhow::{Context, anyhow};
 use base64::prelude::*;
 use load_balancer::{LoadBalancer, interval::IntervalLoadBalancer};
-use reqwest::{Client, ClientBuilder, Proxy, Response, header::HeaderMap};
+use reqwest::{Client, ClientBuilder, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{net::IpAddr, sync::Arc, time::Duration};
@@ -10,12 +10,14 @@ pub use load_balancer;
 pub use load_balancer::get_if_addrs;
 pub use load_balancer::ip::{get_ip_list, get_ipv4_list, get_ipv6_list};
 pub use reqwest;
+pub use reqwest::Proxy;
+pub use reqwest::header::HeaderMap;
 
 /// Builder for configuring and creating a `JitoClient`.
 pub struct JitoClientBuilder {
     url: Vec<String>,
-    rate: u64,
     broadcast: bool,
+    interval: Duration,
     timeout: Option<Duration>,
     proxy: Option<Proxy>,
     headers: Option<HeaderMap>,
@@ -27,8 +29,8 @@ impl JitoClientBuilder {
     pub fn new() -> Self {
         Self {
             url: vec!["https://mainnet.block-engine.jito.wtf".to_string()],
-            rate: 0,
             broadcast: false,
+            interval: Duration::ZERO,
             timeout: None,
             proxy: None,
             headers: None,
@@ -42,9 +44,10 @@ impl JitoClientBuilder {
         self
     }
 
-    /// Sets the request rate limit (requests per second, 0 = unlimited).
-    pub fn rate(mut self, rate: u64) -> Self {
-        self.rate = rate;
+    /// Sets the interval duration between requests (0 = unlimited)
+    /// For example, 5 requests per second = 200 ms interval.
+    pub fn interval(mut self, interval: Duration) -> Self {
+        self.interval = interval;
         self
     }
 
@@ -54,7 +57,7 @@ impl JitoClientBuilder {
         self
     }
 
-    /// Configures the client to send requests to all URLs in parallel.
+    /// Broadcast each request to all configured URLs.
     pub fn broadcast(mut self, broadcast: bool) -> Self {
         self.broadcast = broadcast;
         self
@@ -66,13 +69,13 @@ impl JitoClientBuilder {
         self
     }
 
-    /// Sets an optional proxy for the client.
+    /// Sets a proxy for the client.
     pub fn proxy(mut self, proxy: Proxy) -> Self {
         self.proxy = Some(proxy);
         self
     }
 
-    /// Sets an optional header for the client.
+    /// Sets headers for the client.
     pub fn headers(mut self, headers: HeaderMap) -> Self {
         self.headers = Some(headers);
         self
@@ -80,12 +83,6 @@ impl JitoClientBuilder {
 
     /// Builds the `JitoClient` with the configured options.
     pub fn build(self) -> anyhow::Result<JitoClient> {
-        let interval = if self.rate == 0 {
-            Duration::ZERO
-        } else {
-            Duration::from_millis(1000).div_f64(self.rate as f64)
-        };
-
         let default_ip = self.ip.is_empty();
 
         let inner = if self.broadcast {
@@ -106,7 +103,7 @@ impl JitoClientBuilder {
                     cb = cb.default_headers(v);
                 }
 
-                entries.push((interval, Arc::new((self.url.clone(), cb.build()?))));
+                entries.push((self.interval, Arc::new((self.url.clone(), cb.build()?))));
             } else {
                 for ip in &self.ip {
                     let mut cb = ClientBuilder::new();
@@ -125,7 +122,7 @@ impl JitoClientBuilder {
 
                     cb = cb.local_address(*ip);
 
-                    entries.push((interval, Arc::new((self.url.clone(), cb.build()?))));
+                    entries.push((self.interval, Arc::new((self.url.clone(), cb.build()?))));
                 }
             }
 
@@ -152,7 +149,7 @@ impl JitoClientBuilder {
                         cb = cb.default_headers(v);
                     }
 
-                    entries.push((interval, Arc::new((vec![url.clone()], cb.build()?))));
+                    entries.push((self.interval, Arc::new((vec![url.clone()], cb.build()?))));
                 }
             } else {
                 for url in &self.url {
@@ -173,7 +170,7 @@ impl JitoClientBuilder {
 
                         cb = cb.local_address(*ip);
 
-                        entries.push((interval, Arc::new((vec![url.clone()], cb.build()?))));
+                        entries.push((self.interval, Arc::new((vec![url.clone()], cb.build()?))));
                     }
                 }
             }
@@ -246,11 +243,12 @@ impl JitoClient {
         Ok(self
             .send_transaction(tx)
             .await?
+            .error_for_status()?
             .headers()
             .get("x-bundle-id")
             .ok_or_else(|| anyhow!("missing `x-bundle-id` header"))?
             .to_str()
-            .map_err(|e| anyhow!("invalid `x-bundle-id` header: {}", e))?
+            .map_err(|v| anyhow!("invalid `x-bundle-id` header: {}", v))?
             .to_string())
     }
 
@@ -338,6 +336,7 @@ impl JitoClient {
     ) -> anyhow::Result<String> {
         self.send_bundle(tx)
             .await?
+            .error_for_status()?
             .json::<serde_json::Value>()
             .await?["result"]
             .as_str()
@@ -397,11 +396,12 @@ impl JitoClient {
         Ok(self
             .send_transaction_lazy(tx)
             .await?
+            .error_for_status()?
             .headers()
             .get("x-bundle-id")
             .ok_or_else(|| anyhow!("missing `x-bundle-id` header"))?
             .to_str()
-            .map_err(|e| anyhow!("invalid `x-bundle-id` header: {}", e))?
+            .map_err(|v| anyhow!("invalid `x-bundle-id` header: {}", v))?
             .to_string())
     }
 
@@ -502,6 +502,7 @@ impl JitoClient {
     {
         self.send_bundle_lazy(tx)
             .await?
+            .error_for_status()?
             .json::<serde_json::Value>()
             .await?["result"]
             .as_str()
@@ -559,11 +560,12 @@ impl JitoClient {
         Ok(self
             .send_transaction_lazy_fn(callback)
             .await?
+            .error_for_status()?
             .headers()
             .get("x-bundle-id")
             .ok_or_else(|| anyhow!("missing `x-bundle-id` header"))?
             .to_str()
-            .map_err(|e| anyhow!("invalid `x-bundle-id` header: {}", e))?
+            .map_err(|v| anyhow!("invalid `x-bundle-id` header: {}", v))?
             .to_string())
     }
 
@@ -664,6 +666,7 @@ impl JitoClient {
     {
         self.send_bundle_lazy_fn(callback)
             .await?
+            .error_for_status()?
             .json::<serde_json::Value>()
             .await?["result"]
             .as_str()
