@@ -74,7 +74,7 @@ async fn main() {
   let client = JitoClientBuilder::new()
       // Sets a timeout duration for requests
       .timeout(Duration::from_millis(5000))
-      /// Sets an header for the client
+      // Sets an header for the client
       .headers(HeaderMap::new())
       // Sets an proxy for the client
       // warning: .ip(get_ipv4_list().unwrap()) must be on the same network segment as the proxy
