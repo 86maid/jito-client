@@ -16,7 +16,7 @@ A Rust client for interacting with the Jito network, supporting **rate limiting*
 ### Default
 
 ```rust
-use jito_client::JitoClient;
+use jito_client::*;
 
 #[tokio::main]
 async fn main() {
@@ -35,7 +35,7 @@ async fn main() {
 ### Customized
 
 ```rust
-use jito_client::JitoClientBuilder;
+use jito_client::*;
 
 #[tokio::main]
 async fn main() {
@@ -43,8 +43,8 @@ async fn main() {
   let client = JitoClientBuilder::new()
       // Sets the request rate limit (requests per second, 0 = unlimited)
       .rate(1)
-      // Enables sending requests via multiple IPs (both IPv4 and IPv6)
-      .multi_ip(true)
+      // Enables sending requests via multiple IPs
+      .ip(get_ipv4_list().unwrap())
       // Sets the target URLs for the client
       .url(&[
           "https://amsterdam.mainnet.block-engine.jito.wtf",
@@ -59,7 +59,7 @@ async fn main() {
 ### Broadcast
 
 ```rust
-use jito_client::JitoClientBuilder;
+use jito_client::*;
 
 #[tokio::main]
 async fn main() {

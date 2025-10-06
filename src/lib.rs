@@ -1,25 +1,20 @@
-use anyhow::{Context, anyhow, bail};
+use anyhow::{Context, anyhow};
 use base64::prelude::*;
-use load_balancer::{
-    LoadBalancer,
-    interval::IntervalLoadBalancer,
-    ip::{get_ip_list, get_ipv4_list, get_ipv6_list},
-};
+use load_balancer::{LoadBalancer, interval::IntervalLoadBalancer};
 use reqwest::{Client, ClientBuilder, Proxy, Response, header::HeaderMap};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{net::IpAddr, sync::Arc, time::Duration};
 
 pub use load_balancer;
+pub use load_balancer::get_if_addrs;
+pub use load_balancer::ip::{get_ip_list, get_ipv4_list, get_ipv6_list};
 pub use reqwest;
 
 /// Builder for configuring and creating a `JitoClient`.
 pub struct JitoClientBuilder {
     url: Vec<String>,
     rate: u64,
-    multi_ipv4: bool,
-    multi_ipv6: bool,
-    multi_ip: bool,
     broadcast: bool,
     timeout: Option<Duration>,
     proxy: Option<Proxy>,
@@ -33,9 +28,6 @@ impl JitoClientBuilder {
         Self {
             url: vec!["https://mainnet.block-engine.jito.wtf".to_string()],
             rate: 0,
-            multi_ipv4: false,
-            multi_ipv6: false,
-            multi_ip: false,
             broadcast: false,
             timeout: None,
             proxy: None,
@@ -56,26 +48,8 @@ impl JitoClientBuilder {
         self
     }
 
-    /// Enables sending requests via multiple IPv4 addresses.
-    pub fn multi_ipv4(mut self, multi_ip: bool) -> Self {
-        self.multi_ipv4 = multi_ip;
-        self
-    }
-
-    /// Enables sending requests via multiple IPv6 addresses.
-    pub fn multi_ipv6(mut self, multi_ip: bool) -> Self {
-        self.multi_ipv6 = multi_ip;
-        self
-    }
-
-    /// Enables sending requests via multiple IPs (both IPv4 and IPv6).
-    pub fn multi_ip(mut self, multi_ip: bool) -> Self {
-        self.multi_ip = multi_ip;
-        self
-    }
-
     /// Sets the local IP addresses to bind outgoing requests to.
-    pub fn with_ip(mut self, ip: Vec<IpAddr>) -> Self {
+    pub fn ip(mut self, ip: Vec<IpAddr>) -> Self {
         self.ip = ip;
         self
     }
@@ -105,34 +79,14 @@ impl JitoClientBuilder {
     }
 
     /// Builds the `JitoClient` with the configured options.
-    pub fn build(mut self) -> anyhow::Result<JitoClient> {
+    pub fn build(self) -> anyhow::Result<JitoClient> {
         let interval = if self.rate == 0 {
             Duration::ZERO
         } else {
             Duration::from_millis(1000).div_f64(self.rate as f64)
         };
 
-        if self.multi_ipv4 {
-            self.ip.extend(load_balancer::ip::get_ipv4_list());
-        }
-
-        if self.multi_ipv6 {
-            self.ip.extend(load_balancer::ip::get_ipv6_list());
-        }
-
-        if self.multi_ip {
-            if self.multi_ipv4 || self.multi_ipv6 {
-                bail!("`multi_ip` is mutually exclusive with `multi_ipv4`/`multi_ipv6`");
-            }
-
-            self.ip.extend(load_balancer::ip::get_ip_list());
-        }
-
-        let default_ip = !self.multi_ipv4 && !self.multi_ipv6 && !self.multi_ip;
-
-        if !default_ip && self.ip.is_empty() {
-            bail!("local ip is empty");
-        }
+        let default_ip = self.ip.is_empty();
 
         let inner = if self.broadcast {
             let mut entries = Vec::new();
@@ -390,6 +344,332 @@ impl JitoClient {
             .map(|v| v.to_string())
             .ok_or_else(|| anyhow::anyhow!("missing bundle result"))
     }
+
+    /// Sends a single transaction and returns the HTTP response, with lazy serialization.
+    pub async fn send_transaction_lazy<T>(
+        &self,
+        tx: impl Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<Response>
+    where
+        T: Serialize,
+    {
+        let (ref url, ref client) = *self.inner.lb.alloc().await;
+
+        let data = BASE64_STANDARD.encode(bincode::serialize(&tx.await?)?);
+
+        let body = json!({
+            "id": 1,
+            "jsonrpc": "2.0",
+            "method": "sendTransaction",
+            "params": [
+                data, { "encoding": "base64" }
+            ]
+        });
+
+        if self.inner.broadcast {
+            Ok(futures::future::select_ok(url.iter().map(|v| {
+                client
+                    .post(&format!("{}/api/v1/transactions", v))
+                    .query(&["bundleOnly", "true"])
+                    .json(&body)
+                    .send()
+            }))
+            .await?
+            .0)
+        } else {
+            Ok(client
+                .post(&format!("{}/api/v1/transactions", url[0]))
+                .query(&["bundleOnly", "true"])
+                .json(&body)
+                .send()
+                .await?)
+        }
+    }
+
+    /// Sends a transaction and returns the bundle ID from the response headers, with lazy serialization.
+    pub async fn send_transaction_bid_lazy<T>(
+        &self,
+        tx: impl Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<String>
+    where
+        T: Serialize,
+    {
+        Ok(self
+            .send_transaction_lazy(tx)
+            .await?
+            .headers()
+            .get("x-bundle-id")
+            .ok_or_else(|| anyhow!("missing `x-bundle-id` header"))?
+            .to_str()
+            .map_err(|e| anyhow!("invalid `x-bundle-id` header: {}", e))?
+            .to_string())
+    }
+
+    /// Sends a transaction without `bundleOnly` flag, with lazy serialization.
+    pub async fn send_transaction_no_bundle_only_lazy<T>(
+        &self,
+        tx: impl Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<Response>
+    where
+        T: Serialize,
+    {
+        let (ref url, ref client) = *self.inner.lb.alloc().await;
+
+        let data = BASE64_STANDARD.encode(bincode::serialize(&tx.await?)?);
+
+        let body = json!({
+            "id": 1,
+            "jsonrpc": "2.0",
+            "method": "sendTransaction",
+            "params": [
+                data, { "encoding": "base64" }
+            ]
+        });
+
+        if self.inner.broadcast {
+            Ok(futures::future::select_ok(url.iter().map(|v| {
+                client
+                    .post(&format!("{}/api/v1/transactions", v))
+                    .json(&body)
+                    .send()
+            }))
+            .await?
+            .0)
+        } else {
+            Ok(client
+                .post(&format!("{}/api/v1/transactions", url[0]))
+                .json(&body)
+                .send()
+                .await?)
+        }
+    }
+
+    /// Sends multiple transactions as a bundle, with lazy serialization.
+    pub async fn send_bundle_lazy<T, S>(
+        &self,
+        tx: impl Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<Response>
+    where
+        T: IntoIterator<Item = S>,
+        S: Serialize,
+    {
+        let (ref url, ref client) = *self.inner.lb.alloc().await;
+
+        let data = tx
+            .await?
+            .into_iter()
+            .map(|tx| {
+                Ok(BASE64_STANDARD.encode(
+                    bincode::serialize(&tx)
+                        .map_err(|v| anyhow::anyhow!("failed to serialize tx: {}", v))?,
+                ))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        let body = json!({
+            "id": 1,
+            "jsonrpc": "2.0",
+            "method": "sendBundle",
+            "params": [ data, { "encoding": "base64" } ]
+        });
+
+        if self.inner.broadcast {
+            Ok(futures::future::select_ok(url.iter().map(|v| {
+                client
+                    .post(&format!("{}/api/v1/bundles", v))
+                    .json(&body)
+                    .send()
+            }))
+            .await?
+            .0)
+        } else {
+            Ok(client
+                .post(&format!("{}/api/v1/bundles", url[0]))
+                .json(&body)
+                .send()
+                .await?)
+        }
+    }
+
+    /// Sends a bundle and returns its bundle ID from the JSON response, with lazy serialization.
+    pub async fn send_bundle_bid_lazy<T, S>(
+        &self,
+        tx: impl Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<String>
+    where
+        T: IntoIterator<Item = S>,
+        S: Serialize,
+    {
+        self.send_bundle_lazy(tx)
+            .await?
+            .json::<serde_json::Value>()
+            .await?["result"]
+            .as_str()
+            .map(|v| v.to_string())
+            .ok_or_else(|| anyhow::anyhow!("missing bundle result"))
+    }
+
+    /// Sends a single transaction and returns the HTTP response, with lazy serialization.
+    #[cfg(rustc_version_1_85_0)]
+    pub async fn send_transaction_lazy_fn<F, T>(&self, callback: F) -> anyhow::Result<Response>
+    where
+        F: AsyncFnOnce(&Vec<String>, &Client) -> anyhow::Result<T>,
+        T: Serialize,
+    {
+        let (ref url, ref client) = *self.inner.lb.alloc().await;
+
+        let data = BASE64_STANDARD.encode(bincode::serialize(&callback(url, client).await?)?);
+
+        let body = json!({
+            "id": 1,
+            "jsonrpc": "2.0",
+            "method": "sendTransaction",
+            "params": [
+                data, { "encoding": "base64" }
+            ]
+        });
+
+        if self.inner.broadcast {
+            Ok(futures::future::select_ok(url.iter().map(|v| {
+                client
+                    .post(&format!("{}/api/v1/transactions", v))
+                    .query(&["bundleOnly", "true"])
+                    .json(&body)
+                    .send()
+            }))
+            .await?
+            .0)
+        } else {
+            Ok(client
+                .post(&format!("{}/api/v1/transactions", url[0]))
+                .query(&["bundleOnly", "true"])
+                .json(&body)
+                .send()
+                .await?)
+        }
+    }
+
+    /// Sends a transaction and returns the bundle ID from the response headers, with lazy serialization.
+    #[cfg(rustc_version_1_85_0)]
+    pub async fn send_transaction_bid_lazy_fn<F, T>(&self, callback: F) -> anyhow::Result<String>
+    where
+        F: AsyncFnOnce(&Vec<String>, &Client) -> anyhow::Result<T>,
+        T: Serialize,
+    {
+        Ok(self
+            .send_transaction_lazy_fn(callback)
+            .await?
+            .headers()
+            .get("x-bundle-id")
+            .ok_or_else(|| anyhow!("missing `x-bundle-id` header"))?
+            .to_str()
+            .map_err(|e| anyhow!("invalid `x-bundle-id` header: {}", e))?
+            .to_string())
+    }
+
+    /// Sends a transaction without `bundleOnly` flag, with lazy serialization.
+    #[cfg(rustc_version_1_85_0)]
+    pub async fn send_transaction_no_bundle_only_lazy_fn<F, T>(
+        &self,
+        callback: F,
+    ) -> anyhow::Result<Response>
+    where
+        F: AsyncFnOnce(&Vec<String>, &Client) -> anyhow::Result<T>,
+        T: Serialize,
+    {
+        let (ref url, ref client) = *self.inner.lb.alloc().await;
+
+        let data = BASE64_STANDARD.encode(bincode::serialize(&callback(url, client).await?)?);
+
+        let body = json!({
+            "id": 1,
+            "jsonrpc": "2.0",
+            "method": "sendTransaction",
+            "params": [
+                data, { "encoding": "base64" }
+            ]
+        });
+
+        if self.inner.broadcast {
+            Ok(futures::future::select_ok(url.iter().map(|v| {
+                client
+                    .post(&format!("{}/api/v1/transactions", v))
+                    .json(&body)
+                    .send()
+            }))
+            .await?
+            .0)
+        } else {
+            Ok(client
+                .post(&format!("{}/api/v1/transactions", url[0]))
+                .json(&body)
+                .send()
+                .await?)
+        }
+    }
+
+    /// Sends multiple transactions as a bundle, with lazy serialization.
+    #[cfg(rustc_version_1_85_0)]
+    pub async fn send_bundle_lazy_fn<F, T, S>(&self, callback: F) -> anyhow::Result<Response>
+    where
+        F: AsyncFnOnce(&Vec<String>, &Client) -> anyhow::Result<T>,
+        T: IntoIterator<Item = S>,
+        S: Serialize,
+    {
+        let (ref url, ref client) = *self.inner.lb.alloc().await;
+
+        let data = callback(url, client)
+            .await?
+            .into_iter()
+            .map(|tx| {
+                Ok(BASE64_STANDARD.encode(
+                    bincode::serialize(&tx)
+                        .map_err(|v| anyhow::anyhow!("failed to serialize tx: {}", v))?,
+                ))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        let body = json!({
+            "id": 1,
+            "jsonrpc": "2.0",
+            "method": "sendBundle",
+            "params": [ data, { "encoding": "base64" } ]
+        });
+
+        if self.inner.broadcast {
+            Ok(futures::future::select_ok(url.iter().map(|v| {
+                client
+                    .post(&format!("{}/api/v1/bundles", v))
+                    .json(&body)
+                    .send()
+            }))
+            .await?
+            .0)
+        } else {
+            Ok(client
+                .post(&format!("{}/api/v1/bundles", url[0]))
+                .json(&body)
+                .send()
+                .await?)
+        }
+    }
+
+    /// Sends a bundle and returns its bundle ID from the JSON response, with lazy serialization.
+    #[cfg(rustc_version_1_85_0)]
+    pub async fn send_bundle_bid_lazy_fn<F, T, S>(&self, callback: F) -> anyhow::Result<String>
+    where
+        F: AsyncFnOnce(&Vec<String>, &Client) -> anyhow::Result<T>,
+        T: IntoIterator<Item = S>,
+        S: Serialize,
+    {
+        self.send_bundle_lazy_fn(callback)
+            .await?
+            .json::<serde_json::Value>()
+            .await?["result"]
+            .as_str()
+            .map(|v| v.to_string())
+            .ok_or_else(|| anyhow::anyhow!("missing bundle result"))
+    }
 }
 
 /// Represents Jito tip data.
@@ -500,7 +780,7 @@ pub async fn get_inflight_bundle_statuses<T: IntoIterator<Item = impl AsRef<str>
         .result)
 }
 
-pub async fn test_ip(ip: IpAddr) -> anyhow::Result<()> {
+pub async fn test_ip(ip: IpAddr) -> anyhow::Result<IpAddr> {
     reqwest::ClientBuilder::new()
         .timeout(Duration::from_secs(3))
         .local_address(ip)
@@ -509,17 +789,26 @@ pub async fn test_ip(ip: IpAddr) -> anyhow::Result<()> {
         .send()
         .await?;
 
-    Ok(())
+    Ok(ip)
 }
 
-pub async fn test_all_ip() -> Vec<anyhow::Result<()>> {
-    futures::future::join_all(get_ip_list().into_iter().map(|v| test_ip(v))).await
+pub async fn test_all_ip() -> Vec<anyhow::Result<IpAddr>> {
+    match get_ip_list() {
+        Ok(v) => futures::future::join_all(v.into_iter().map(|v| test_ip(v))).await,
+        Err(_) => Vec::new(),
+    }
 }
 
-pub async fn test_all_ipv4() -> Vec<anyhow::Result<()>> {
-    futures::future::join_all(get_ipv4_list().into_iter().map(|v| test_ip(v))).await
+pub async fn test_all_ipv4() -> Vec<anyhow::Result<IpAddr>> {
+    match get_ipv4_list() {
+        Ok(v) => futures::future::join_all(v.into_iter().map(|v| test_ip(v))).await,
+        Err(_) => Vec::new(),
+    }
 }
 
-pub async fn test_all_ipv6() -> Vec<anyhow::Result<()>> {
-    futures::future::join_all(get_ipv6_list().into_iter().map(|v| test_ip(v))).await
+pub async fn test_all_ipv6() -> Vec<anyhow::Result<IpAddr>> {
+    match get_ipv6_list() {
+        Ok(v) => futures::future::join_all(v.into_iter().map(|v| test_ip(v))).await,
+        Err(_) => Vec::new(),
+    }
 }
