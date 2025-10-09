@@ -927,7 +927,7 @@ pub async fn test_ip(ip: IpAddr) -> anyhow::Result<IpAddr> {
         .timeout(Duration::from_secs(3))
         .local_address(ip)
         .build()?
-        .get("https://crates.io")
+        .get("https://bilibili.com")
         .send()
         .await?;
 
