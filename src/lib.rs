@@ -210,18 +210,13 @@ impl JitoClient {
         let (ref url, ref client) = *self.inner.lb.alloc().await;
 
         if self.inner.broadcast {
-            Ok(futures::future::select_ok(
-                url.iter()
-                    .map(|v| client.post(&format!("{}", v)).json(body).send()),
+            Ok(
+                futures::future::select_ok(url.iter().map(|v| client.post(v).json(body).send()))
+                    .await?
+                    .0,
             )
-            .await?
-            .0)
         } else {
-            Ok(client
-                .post(&format!("{}", url[0]))
-                .json(body)
-                .send()
-                .await?)
+            Ok(client.post(&url[0]).json(body).send().await?)
         }
     }
 
