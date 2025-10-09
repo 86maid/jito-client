@@ -12,6 +12,7 @@ pub use load_balancer::ip::{get_ip_list, get_ipv4_list, get_ipv6_list};
 pub use reqwest;
 pub use reqwest::Proxy;
 pub use reqwest::header::HeaderMap;
+pub use serde_json;
 
 /// Builder for configuring and creating a `JitoClient`.
 pub struct JitoClientBuilder {
@@ -202,6 +203,60 @@ impl JitoClient {
     /// Creates a new client with default settings.
     pub fn new() -> Self {
         JitoClientBuilder::new().build().unwrap()
+    }
+
+    /// Sends a raw request.
+    pub async fn raw_send<T, S>(&mut self, body: &serde_json::Value) -> anyhow::Result<Response>
+    where
+        T: IntoIterator<Item = S>,
+        S: Serialize,
+    {
+        let (ref url, ref client) = *self.inner.lb.alloc().await;
+
+        if self.inner.broadcast {
+            Ok(futures::future::select_ok(
+                url.iter()
+                    .map(|v| client.post(&format!("{}", v)).json(body).send()),
+            )
+            .await?
+            .0)
+        } else {
+            Ok(client
+                .post(&format!("{}", url[0]))
+                .json(body)
+                .send()
+                .await?)
+        }
+    }
+
+    /// Sends a raw request, use base_url + api_url.
+    pub async fn raw_send_api<T, S>(
+        &mut self,
+        api_url: impl AsRef<str>,
+        body: &serde_json::Value,
+    ) -> anyhow::Result<Response>
+    where
+        T: IntoIterator<Item = S>,
+        S: Serialize,
+    {
+        let (ref url, ref client) = *self.inner.lb.alloc().await;
+
+        if self.inner.broadcast {
+            Ok(futures::future::select_ok(url.iter().map(|v| {
+                client
+                    .post(&format!("{}{}", v, api_url.as_ref()))
+                    .json(body)
+                    .send()
+            }))
+            .await?
+            .0)
+        } else {
+            Ok(client
+                .post(&format!("{}{}", url[0], api_url.as_ref()))
+                .json(body)
+                .send()
+                .await?)
+        }
     }
 
     /// Sends a single transaction and returns the HTTP response.
@@ -814,4 +869,21 @@ pub async fn test_all_ipv6() -> Vec<anyhow::Result<IpAddr>> {
         Ok(v) => futures::future::join_all(v.into_iter().map(|v| test_ip(v))).await,
         Err(_) => Vec::new(),
     }
+}
+
+pub fn serialize_tx(tx: impl Serialize) -> anyhow::Result<String> {
+    Ok(BASE64_STANDARD.encode(bincode::serialize(&tx)?))
+}
+
+pub fn serialize_tx_vec<T: IntoIterator<Item = impl Serialize>>(
+    tx: T,
+) -> anyhow::Result<Vec<String>> {
+    tx.into_iter()
+        .map(|tx| {
+            Ok(BASE64_STANDARD.encode(
+                bincode::serialize(&tx)
+                    .map_err(|v| anyhow::anyhow!("failed to serialize tx: {}", v))?,
+            ))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()
 }
