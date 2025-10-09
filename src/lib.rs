@@ -206,7 +206,7 @@ impl JitoClient {
     }
 
     /// Sends a raw request.
-    pub async fn raw_send(&mut self, body: &serde_json::Value) -> anyhow::Result<Response> {
+    pub async fn raw_send(&self, body: &serde_json::Value) -> anyhow::Result<Response> {
         let (ref url, ref client) = *self.inner.lb.alloc().await;
 
         if self.inner.broadcast {
@@ -222,7 +222,7 @@ impl JitoClient {
 
     /// Sends a raw request, use base_url + api_url.
     pub async fn raw_send_api(
-        &mut self,
+        &self,
         api_url: impl AsRef<str>,
         body: &serde_json::Value,
     ) -> anyhow::Result<Response> {
@@ -248,7 +248,7 @@ impl JitoClient {
 
     /// Sends a raw request, with lazy body construction.
     pub async fn raw_send_lazy(
-        &mut self,
+        &self,
         body: impl Future<Output = anyhow::Result<serde_json::Value>>,
     ) -> anyhow::Result<Response> {
         let (ref url, ref client) = *self.inner.lb.alloc().await;
@@ -267,7 +267,7 @@ impl JitoClient {
 
     /// Sends a raw request, use base_url + api_url, with lazy body construction.
     pub async fn raw_send_api_lazy(
-        &mut self,
+        &self,
         api_url: impl AsRef<str>,
         body: impl Future<Output = anyhow::Result<serde_json::Value>>,
     ) -> anyhow::Result<Response> {
@@ -294,7 +294,7 @@ impl JitoClient {
 
     /// Sends a raw request, with lazy function to build the body.
     #[cfg(rustc_version_1_85_0)]
-    pub async fn raw_send_lazy_fn<F>(&mut self, callback: F) -> anyhow::Result<Response>
+    pub async fn raw_send_lazy_fn<F>(&self, callback: F) -> anyhow::Result<Response>
     where
         F: AsyncFnOnce(&Vec<String>, &Client) -> anyhow::Result<serde_json::Value>,
     {
@@ -315,7 +315,7 @@ impl JitoClient {
     /// Sends a raw request, use base_url + api_url, with lazy function to build the body.
     #[cfg(rustc_version_1_85_0)]
     pub async fn raw_send_api_lazy_fn<F>(
-        &mut self,
+        &self,
         api_url: impl AsRef<str>,
         callback: F,
     ) -> anyhow::Result<Response>
