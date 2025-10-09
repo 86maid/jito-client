@@ -246,6 +246,103 @@ impl JitoClient {
         }
     }
 
+    /// Sends a raw request, with lazy body construction.
+    pub async fn raw_send_lazy(
+        &mut self,
+        body: impl Future<Output = anyhow::Result<serde_json::Value>>,
+    ) -> anyhow::Result<Response> {
+        let (ref url, ref client) = *self.inner.lb.alloc().await;
+        let body = body.await?;
+
+        if self.inner.broadcast {
+            Ok(
+                futures::future::select_ok(url.iter().map(|v| client.post(v).json(&body).send()))
+                    .await?
+                    .0,
+            )
+        } else {
+            Ok(client.post(&url[0]).json(&body).send().await?)
+        }
+    }
+
+    /// Sends a raw request, use base_url + api_url, with lazy body construction.
+    pub async fn raw_send_api_lazy(
+        &mut self,
+        api_url: impl AsRef<str>,
+        body: impl Future<Output = anyhow::Result<serde_json::Value>>,
+    ) -> anyhow::Result<Response> {
+        let (ref url, ref client) = *self.inner.lb.alloc().await;
+        let body = body.await?;
+
+        if self.inner.broadcast {
+            Ok(futures::future::select_ok(url.iter().map(|v| {
+                client
+                    .post(&format!("{}{}", v, api_url.as_ref()))
+                    .json(&body)
+                    .send()
+            }))
+            .await?
+            .0)
+        } else {
+            Ok(client
+                .post(&format!("{}{}", url[0], api_url.as_ref()))
+                .json(&body)
+                .send()
+                .await?)
+        }
+    }
+
+    /// Sends a raw request, with lazy function to build the body.
+    #[cfg(rustc_version_1_85_0)]
+    pub async fn raw_send_lazy_fn<F>(&mut self, callback: F) -> anyhow::Result<Response>
+    where
+        F: AsyncFnOnce(&Vec<String>, &Client) -> anyhow::Result<serde_json::Value>,
+    {
+        let (ref url, ref client) = *self.inner.lb.alloc().await;
+        let body = callback(url, client).await?;
+
+        if self.inner.broadcast {
+            Ok(
+                futures::future::select_ok(url.iter().map(|v| client.post(v).json(&body).send()))
+                    .await?
+                    .0,
+            )
+        } else {
+            Ok(client.post(&url[0]).json(&body).send().await?)
+        }
+    }
+
+    /// Sends a raw request, use base_url + api_url, with lazy function to build the body.
+    #[cfg(rustc_version_1_85_0)]
+    pub async fn raw_send_api_lazy_fn<F>(
+        &mut self,
+        api_url: impl AsRef<str>,
+        callback: F,
+    ) -> anyhow::Result<Response>
+    where
+        F: AsyncFnOnce(&Vec<String>, &Client) -> anyhow::Result<serde_json::Value>,
+    {
+        let (ref url, ref client) = *self.inner.lb.alloc().await;
+        let body = callback(url, client).await?;
+
+        if self.inner.broadcast {
+            Ok(futures::future::select_ok(url.iter().map(|v| {
+                client
+                    .post(&format!("{}{}", v, api_url.as_ref()))
+                    .json(&body)
+                    .send()
+            }))
+            .await?
+            .0)
+        } else {
+            Ok(client
+                .post(&format!("{}{}", url[0], api_url.as_ref()))
+                .json(&body)
+                .send()
+                .await?)
+        }
+    }
+
     /// Sends a single transaction and returns the HTTP response.
     pub async fn send_transaction(&self, tx: impl Serialize) -> anyhow::Result<Response> {
         let data = BASE64_STANDARD.encode(bincode::serialize(&tx)?);
