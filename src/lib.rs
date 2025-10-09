@@ -226,15 +226,11 @@ impl JitoClient {
     }
 
     /// Sends a raw request, use base_url + api_url.
-    pub async fn raw_send_api<T, S>(
+    pub async fn raw_send_api(
         &mut self,
         api_url: impl AsRef<str>,
         body: &serde_json::Value,
-    ) -> anyhow::Result<Response>
-    where
-        T: IntoIterator<Item = S>,
-        S: Serialize,
-    {
+    ) -> anyhow::Result<Response> {
         let (ref url, ref client) = *self.inner.lb.alloc().await;
 
         if self.inner.broadcast {
