@@ -797,7 +797,7 @@ checksum = "4a5f13b858c8d314ee3e8f639011f7ccefe71f97f96e50151fb991f267928e2c"
 
 [[package]]
 name = "jito-client"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "base64",
@@ -846,12 +846,13 @@ checksum = "f5e54036fe321fd421e10d732f155734c4e4afd610dd556d9a82833ab3ee0bed"
 
 [[package]]
 name = "load-balancer"
-version = "0.3.5"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "676019ee0028eea839cb8d8aaced23ee0e9fce8a72692b903bd516ed0e991659"
+checksum = "1deea55b31f3d4b7d882b416e822cc7040d0fd5d27fcc4596cb44ca2800d1f59"
 dependencies = [
  "anyhow",
  "async-trait",
+ "futures",
  "get_if_addrs",
  "rand",
  "reqwest",
