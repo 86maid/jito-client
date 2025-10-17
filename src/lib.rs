@@ -1,14 +1,16 @@
 use anyhow::{Context, anyhow};
 use base64::prelude::*;
+use futures::future::join_all;
 use load_balancer::{LoadBalancer, interval::IntervalLoadBalancer};
 use reqwest::{Client, ClientBuilder, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{net::IpAddr, sync::Arc, time::Duration};
+use tokio::spawn;
+use tokio::sync::Semaphore;
 
+pub use get_if_addrs::get_if_addrs;
 pub use load_balancer;
-pub use load_balancer::get_if_addrs;
-pub use load_balancer::ip::{get_ip_list, get_ipv4_list, get_ipv6_list};
 pub use reqwest;
 pub use reqwest::Proxy;
 pub use reqwest::header::HeaderMap;
@@ -23,6 +25,7 @@ pub struct JitoClientBuilder {
     proxy: Option<Proxy>,
     headers: Option<HeaderMap>,
     ip: Vec<IpAddr>,
+    semaphore: Option<Arc<Semaphore>>,
 }
 
 impl JitoClientBuilder {
@@ -36,6 +39,7 @@ impl JitoClientBuilder {
             proxy: None,
             headers: None,
             ip: Vec::new(),
+            semaphore: None,
         }
     }
 
@@ -82,8 +86,18 @@ impl JitoClientBuilder {
         self
     }
 
+    /// Sets semaphore for the client.
+    pub fn semaphore(mut self, semaphore: Arc<Semaphore>) -> Self {
+        self.semaphore = Some(semaphore);
+        self
+    }
+
     /// Builds the `JitoClient` with the configured options.
     pub fn build(self) -> anyhow::Result<JitoClient> {
+        let semaphore = self.semaphore.unwrap_or(
+            Semaphore::new(Duration::from_secs(1).div_duration_f64(self.interval) as usize).into(),
+        );
+
         let default_ip = self.ip.is_empty();
 
         let inner = if self.broadcast {
@@ -129,6 +143,7 @@ impl JitoClientBuilder {
 
             JitoClientRef {
                 broadcast: true,
+                semaphore,
                 lb: IntervalLoadBalancer::new(entries),
             }
         } else {
@@ -178,6 +193,7 @@ impl JitoClientBuilder {
 
             JitoClientRef {
                 broadcast: false,
+                semaphore,
                 lb: IntervalLoadBalancer::new(entries),
             }
         };
@@ -190,6 +206,7 @@ impl JitoClientBuilder {
 
 struct JitoClientRef {
     broadcast: bool,
+    semaphore: Arc<Semaphore>,
     lb: IntervalLoadBalancer<Arc<(Vec<String>, Client)>>,
 }
 
@@ -293,7 +310,6 @@ impl JitoClient {
     }
 
     /// Sends a raw request, with lazy function to build the body.
-    #[cfg(rustc_version_1_85_0)]
     pub async fn raw_send_lazy_fn<F>(&self, callback: F) -> anyhow::Result<Response>
     where
         F: AsyncFnOnce(&Vec<String>, &Client) -> anyhow::Result<serde_json::Value>,
@@ -313,7 +329,6 @@ impl JitoClient {
     }
 
     /// Sends a raw request, use base_url + api_url, with lazy function to build the body.
-    #[cfg(rustc_version_1_85_0)]
     pub async fn raw_send_api_lazy_fn<F>(
         &self,
         api_url: impl AsRef<str>,
@@ -650,7 +665,6 @@ impl JitoClient {
     }
 
     /// Sends a single transaction and returns the HTTP response, with lazy serialization.
-    #[cfg(rustc_version_1_85_0)]
     pub async fn send_transaction_lazy_fn<F, T>(&self, callback: F) -> anyhow::Result<Response>
     where
         F: AsyncFnOnce(&Vec<String>, &Client) -> anyhow::Result<T>,
@@ -690,7 +704,6 @@ impl JitoClient {
     }
 
     /// Sends a transaction and returns the bundle ID from the response headers, with lazy serialization.
-    #[cfg(rustc_version_1_85_0)]
     pub async fn send_transaction_bid_lazy_fn<F, T>(&self, callback: F) -> anyhow::Result<String>
     where
         F: AsyncFnOnce(&Vec<String>, &Client) -> anyhow::Result<T>,
@@ -709,7 +722,6 @@ impl JitoClient {
     }
 
     /// Sends a transaction without `bundleOnly` flag, with lazy serialization.
-    #[cfg(rustc_version_1_85_0)]
     pub async fn send_transaction_no_bundle_only_lazy_fn<F, T>(
         &self,
         callback: F,
@@ -750,7 +762,6 @@ impl JitoClient {
     }
 
     /// Sends multiple transactions as a bundle, with lazy serialization.
-    #[cfg(rustc_version_1_85_0)]
     pub async fn send_bundle_lazy_fn<F, T, S>(&self, callback: F) -> anyhow::Result<Response>
     where
         F: AsyncFnOnce(&Vec<String>, &Client) -> anyhow::Result<T>,
@@ -796,7 +807,6 @@ impl JitoClient {
     }
 
     /// Sends a bundle and returns its bundle ID from the JSON response, with lazy serialization.
-    #[cfg(rustc_version_1_85_0)]
     pub async fn send_bundle_bid_lazy_fn<F, T, S>(&self, callback: F) -> anyhow::Result<String>
     where
         F: AsyncFnOnce(&Vec<String>, &Client) -> anyhow::Result<T>,
@@ -811,6 +821,23 @@ impl JitoClient {
             .as_str()
             .map(|v| v.to_string())
             .ok_or_else(|| anyhow::anyhow!("missing bundle result"))
+    }
+
+    /// Spawns a new asynchronous task that respects the internal semaphore.
+    ///
+    /// The task will only start executing once a permit is acquired from the semaphore.
+    /// When the task completes, the permit is automatically released.
+    pub async fn spawn<F>(&self, future: F)
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let permit = self.inner.semaphore.clone().acquire_owned().await.unwrap();
+
+        spawn(async move {
+            future.await;
+            drop(permit);
+        });
     }
 }
 
@@ -922,12 +949,39 @@ pub async fn get_inflight_bundle_statuses<T: IntoIterator<Item = impl AsRef<str>
         .result)
 }
 
+/// Get all non-loopback IP addresses of the machine.
+pub fn get_ip_list() -> anyhow::Result<Vec<IpAddr>> {
+    Ok(get_if_addrs()?
+        .into_iter()
+        .filter(|v| !v.is_loopback())
+        .map(|v| v.ip())
+        .collect::<Vec<_>>())
+}
+
+/// Get all non-loopback IPv4 addresses of the machine.
+pub fn get_ipv4_list() -> anyhow::Result<Vec<IpAddr>> {
+    Ok(get_if_addrs()?
+        .into_iter()
+        .filter(|v| !v.is_loopback() && v.ip().is_ipv4())
+        .map(|v| v.ip())
+        .collect::<Vec<_>>())
+}
+
+/// Get all non-loopback IPv6 addresses of the machine.
+pub fn get_ipv6_list() -> anyhow::Result<Vec<IpAddr>> {
+    Ok(get_if_addrs()?
+        .into_iter()
+        .filter(|v| !v.is_loopback() && v.ip().is_ipv6())
+        .map(|v| v.ip())
+        .collect::<Vec<_>>())
+}
+
 pub async fn test_ip(ip: IpAddr) -> anyhow::Result<IpAddr> {
     reqwest::ClientBuilder::new()
         .timeout(Duration::from_secs(3))
         .local_address(ip)
         .build()?
-        .get("https://bilibili.com")
+        .get("https://apple.com")
         .send()
         .await?;
 
@@ -936,21 +990,21 @@ pub async fn test_ip(ip: IpAddr) -> anyhow::Result<IpAddr> {
 
 pub async fn test_all_ip() -> Vec<anyhow::Result<IpAddr>> {
     match get_ip_list() {
-        Ok(v) => futures::future::join_all(v.into_iter().map(|v| test_ip(v))).await,
+        Ok(v) => join_all(v.into_iter().map(|v| test_ip(v))).await,
         Err(_) => Vec::new(),
     }
 }
 
 pub async fn test_all_ipv4() -> Vec<anyhow::Result<IpAddr>> {
     match get_ipv4_list() {
-        Ok(v) => futures::future::join_all(v.into_iter().map(|v| test_ip(v))).await,
+        Ok(v) => join_all(v.into_iter().map(|v| test_ip(v))).await,
         Err(_) => Vec::new(),
     }
 }
 
 pub async fn test_all_ipv6() -> Vec<anyhow::Result<IpAddr>> {
     match get_ipv6_list() {
-        Ok(v) => futures::future::join_all(v.into_iter().map(|v| test_ip(v))).await,
+        Ok(v) => join_all(v.into_iter().map(|v| test_ip(v))).await,
         Err(_) => Vec::new(),
     }
 }
