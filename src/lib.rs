@@ -1,8 +1,8 @@
 use anyhow::{Context, anyhow};
 use base64::prelude::*;
-use futures::future::join_all;
+use futures::future::{join_all, select_ok};
 use load_balancer::{LoadBalancer, interval::IntervalLoadBalancer};
-use reqwest::{Client, ClientBuilder, Response};
+use reqwest::{Client, ClientBuilder, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{net::IpAddr, sync::Arc, time::Duration};
@@ -26,6 +26,7 @@ pub struct JitoClientBuilder {
     headers: Option<HeaderMap>,
     ip: Vec<IpAddr>,
     semaphore: Option<Arc<Semaphore>>,
+    broadcast_status: Option<StatusCode>,
 }
 
 impl JitoClientBuilder {
@@ -40,6 +41,7 @@ impl JitoClientBuilder {
             headers: None,
             ip: Vec::new(),
             semaphore: None,
+            broadcast_status: None,
         }
     }
 
@@ -92,10 +94,21 @@ impl JitoClientBuilder {
         self
     }
 
+    /// Sets the status code considered successful in broadcast mode for select_ok.
+    pub fn broadcast_status(mut self, broadcast_status: StatusCode) -> Self {
+        self.broadcast_status = Some(broadcast_status);
+        self
+    }
+
     /// Builds the `JitoClient` with the configured options.
     pub fn build(self) -> anyhow::Result<JitoClient> {
         let semaphore = self.semaphore.unwrap_or(
-            Semaphore::new(Duration::from_secs(1).div_duration_f64(self.interval) as usize).into(),
+            Semaphore::new(if self.interval == Duration::ZERO {
+                usize::MAX
+            } else {
+                Duration::from_secs(1).div_duration_f64(self.interval) as usize
+            })
+            .into(),
         );
 
         let default_ip = self.ip.is_empty();
@@ -142,9 +155,9 @@ impl JitoClientBuilder {
             }
 
             JitoClientRef {
-                broadcast: true,
                 semaphore,
                 lb: IntervalLoadBalancer::new(entries),
+                broadcast_status: self.broadcast_status,
             }
         } else {
             let mut entries = Vec::new();
@@ -192,9 +205,9 @@ impl JitoClientBuilder {
             }
 
             JitoClientRef {
-                broadcast: false,
                 semaphore,
                 lb: IntervalLoadBalancer::new(entries),
+                broadcast_status: self.broadcast_status,
             }
         };
 
@@ -205,9 +218,9 @@ impl JitoClientBuilder {
 }
 
 struct JitoClientRef {
-    broadcast: bool,
     semaphore: Arc<Semaphore>,
     lb: IntervalLoadBalancer<Arc<(Vec<String>, Client)>>,
+    broadcast_status: Option<StatusCode>,
 }
 
 /// Jito client for sending transactions and bundles.
@@ -226,12 +239,28 @@ impl JitoClient {
     pub async fn raw_send(&self, body: &serde_json::Value) -> anyhow::Result<Response> {
         let (ref url, ref client) = *self.inner.lb.alloc().await;
 
-        if self.inner.broadcast {
-            Ok(
-                futures::future::select_ok(url.iter().map(|v| client.post(v).json(body).send()))
-                    .await?
-                    .0,
-            )
+        if url.len() > 1 {
+            Ok(select_ok(url.iter().map(|v| {
+                Box::pin(async move {
+                    let response = client.post(v).json(&body).send().await?;
+
+                    if let Some(v) = self.inner.broadcast_status {
+                        if response.status() == v {
+                            Ok(response)
+                        } else {
+                            Err(anyhow!(
+                                "Status code mismatch: expected {}, found {}",
+                                v,
+                                response.status()
+                            ))
+                        }
+                    } else {
+                        Ok(response)
+                    }
+                })
+            }))
+            .await?
+            .0)
         } else {
             Ok(client.post(&url[0]).json(body).send().await?)
         }
@@ -244,19 +273,37 @@ impl JitoClient {
         body: &serde_json::Value,
     ) -> anyhow::Result<Response> {
         let (ref url, ref client) = *self.inner.lb.alloc().await;
+        let api_url = api_url.as_ref();
 
-        if self.inner.broadcast {
-            Ok(futures::future::select_ok(url.iter().map(|v| {
-                client
-                    .post(&format!("{}{}", v, api_url.as_ref()))
-                    .json(body)
-                    .send()
+        if url.len() > 1 {
+            Ok(select_ok(url.iter().map(|v| {
+                Box::pin(async move {
+                    let response = client
+                        .post(&format!("{}{}", v, api_url))
+                        .json(&body)
+                        .send()
+                        .await?;
+
+                    if let Some(v) = self.inner.broadcast_status {
+                        if response.status() == v {
+                            Ok(response)
+                        } else {
+                            Err(anyhow!(
+                                "Status code mismatch: expected {}, found {}",
+                                v,
+                                response.status()
+                            ))
+                        }
+                    } else {
+                        Ok(response)
+                    }
+                })
             }))
             .await?
             .0)
         } else {
             Ok(client
-                .post(&format!("{}{}", url[0], api_url.as_ref()))
+                .post(&format!("{}{}", url[0], api_url))
                 .json(body)
                 .send()
                 .await?)
@@ -269,16 +316,32 @@ impl JitoClient {
         body: impl Future<Output = anyhow::Result<serde_json::Value>>,
     ) -> anyhow::Result<Response> {
         let (ref url, ref client) = *self.inner.lb.alloc().await;
-        let body = body.await?;
+        let body = &body.await?;
 
-        if self.inner.broadcast {
-            Ok(
-                futures::future::select_ok(url.iter().map(|v| client.post(v).json(&body).send()))
-                    .await?
-                    .0,
-            )
+        if url.len() > 1 {
+            Ok(select_ok(url.iter().map(|v| {
+                Box::pin(async move {
+                    let response = client.post(v).json(body).send().await?;
+
+                    if let Some(v) = self.inner.broadcast_status {
+                        if response.status() == v {
+                            Ok(response)
+                        } else {
+                            Err(anyhow!(
+                                "Status code mismatch: expected {}, found {}",
+                                v,
+                                response.status()
+                            ))
+                        }
+                    } else {
+                        Ok(response)
+                    }
+                })
+            }))
+            .await?
+            .0)
         } else {
-            Ok(client.post(&url[0]).json(&body).send().await?)
+            Ok(client.post(&url[0]).json(body).send().await?)
         }
     }
 
@@ -289,20 +352,38 @@ impl JitoClient {
         body: impl Future<Output = anyhow::Result<serde_json::Value>>,
     ) -> anyhow::Result<Response> {
         let (ref url, ref client) = *self.inner.lb.alloc().await;
-        let body = body.await?;
+        let api_url = api_url.as_ref();
+        let body = &body.await?;
 
-        if self.inner.broadcast {
-            Ok(futures::future::select_ok(url.iter().map(|v| {
-                client
-                    .post(&format!("{}{}", v, api_url.as_ref()))
-                    .json(&body)
-                    .send()
+        if url.len() > 1 {
+            Ok(select_ok(url.iter().map(|v| {
+                Box::pin(async move {
+                    let response = client
+                        .post(&format!("{}{}", v, api_url))
+                        .json(&body)
+                        .send()
+                        .await?;
+
+                    if let Some(v) = self.inner.broadcast_status {
+                        if response.status() == v {
+                            Ok(response)
+                        } else {
+                            Err(anyhow!(
+                                "Status code mismatch: expected {}, found {}",
+                                v,
+                                response.status()
+                            ))
+                        }
+                    } else {
+                        Ok(response)
+                    }
+                })
             }))
             .await?
             .0)
         } else {
             Ok(client
-                .post(&format!("{}{}", url[0], api_url.as_ref()))
+                .post(&format!("{}{}", url[0], api_url))
                 .json(&body)
                 .send()
                 .await?)
@@ -315,16 +396,32 @@ impl JitoClient {
         F: AsyncFnOnce(&Vec<String>, &Client) -> anyhow::Result<serde_json::Value>,
     {
         let (ref url, ref client) = *self.inner.lb.alloc().await;
-        let body = callback(url, client).await?;
+        let body = &callback(url, client).await?;
 
-        if self.inner.broadcast {
-            Ok(
-                futures::future::select_ok(url.iter().map(|v| client.post(v).json(&body).send()))
-                    .await?
-                    .0,
-            )
+        if url.len() > 1 {
+            Ok(select_ok(url.iter().map(|v| {
+                Box::pin(async move {
+                    let response = client.post(v).json(body).send().await?;
+
+                    if let Some(v) = self.inner.broadcast_status {
+                        if response.status() == v {
+                            Ok(response)
+                        } else {
+                            Err(anyhow!(
+                                "Status code mismatch: expected {}, found {}",
+                                v,
+                                response.status()
+                            ))
+                        }
+                    } else {
+                        Ok(response)
+                    }
+                })
+            }))
+            .await?
+            .0)
         } else {
-            Ok(client.post(&url[0]).json(&body).send().await?)
+            Ok(client.post(&url[0]).json(body).send().await?)
         }
     }
 
@@ -338,21 +435,39 @@ impl JitoClient {
         F: AsyncFnOnce(&Vec<String>, &Client) -> anyhow::Result<serde_json::Value>,
     {
         let (ref url, ref client) = *self.inner.lb.alloc().await;
-        let body = callback(url, client).await?;
+        let api_url = api_url.as_ref();
+        let body = &callback(url, client).await?;
 
-        if self.inner.broadcast {
-            Ok(futures::future::select_ok(url.iter().map(|v| {
-                client
-                    .post(&format!("{}{}", v, api_url.as_ref()))
-                    .json(&body)
-                    .send()
+        if url.len() > 1 {
+            Ok(select_ok(url.iter().map(|v| {
+                Box::pin(async move {
+                    let response = client
+                        .post(&format!("{}{}", v, api_url))
+                        .json(body)
+                        .send()
+                        .await?;
+
+                    if let Some(v) = self.inner.broadcast_status {
+                        if response.status() == v {
+                            Ok(response)
+                        } else {
+                            Err(anyhow!(
+                                "Status code mismatch: expected {}, found {}",
+                                v,
+                                response.status()
+                            ))
+                        }
+                    } else {
+                        Ok(response)
+                    }
+                })
             }))
             .await?
             .0)
         } else {
             Ok(client
-                .post(&format!("{}{}", url[0], api_url.as_ref()))
-                .json(&body)
+                .post(&format!("{}{}", url[0], api_url))
+                .json(body)
                 .send()
                 .await?)
         }
@@ -360,8 +475,9 @@ impl JitoClient {
 
     /// Sends a single transaction and returns the HTTP response.
     pub async fn send_transaction(&self, tx: impl Serialize) -> anyhow::Result<Response> {
-        let data = BASE64_STANDARD.encode(bincode::serialize(&tx)?);
-        let body = json!({
+        let data = serialize_tx(tx)?;
+
+        let body = &json!({
             "id": 1,
             "jsonrpc": "2.0",
             "method": "sendTransaction",
@@ -372,21 +488,38 @@ impl JitoClient {
 
         let (ref url, ref client) = *self.inner.lb.alloc().await;
 
-        if self.inner.broadcast {
-            Ok(futures::future::select_ok(url.iter().map(|v| {
-                client
-                    .post(&format!("{}/api/v1/transactions", v))
-                    .query(&["bundleOnly", "true"])
-                    .json(&body)
-                    .send()
+        if url.len() > 1 {
+            Ok(select_ok(url.iter().map(|v| {
+                Box::pin(async move {
+                    let response = client
+                        .post(&format!("{}/api/v1/transactions", v))
+                        .query(&[("bundleOnly", "true")])
+                        .json(body)
+                        .send()
+                        .await?;
+
+                    if let Some(v) = self.inner.broadcast_status {
+                        if response.status() == v {
+                            Ok(response)
+                        } else {
+                            Err(anyhow!(
+                                "Status code mismatch: expected {}, found {}",
+                                v,
+                                response.status()
+                            ))
+                        }
+                    } else {
+                        Ok(response)
+                    }
+                })
             }))
             .await?
             .0)
         } else {
             Ok(client
                 .post(&format!("{}/api/v1/transactions", url[0]))
-                .query(&["bundleOnly", "true"])
-                .json(&body)
+                .query(&[("bundleOnly", "true")])
+                .json(body)
                 .send()
                 .await?)
         }
@@ -411,8 +544,8 @@ impl JitoClient {
         &self,
         tx: impl Serialize,
     ) -> anyhow::Result<Response> {
-        let data = BASE64_STANDARD.encode(bincode::serialize(&tx)?);
-        let body = json!({
+        let data = serialize_tx(tx)?;
+        let body = &json!({
             "id": 1,
             "jsonrpc": "2.0",
             "method": "sendTransaction",
@@ -423,19 +556,36 @@ impl JitoClient {
 
         let (ref url, ref client) = *self.inner.lb.alloc().await;
 
-        if self.inner.broadcast {
-            Ok(futures::future::select_ok(url.iter().map(|v| {
-                client
-                    .post(&format!("{}/api/v1/transactions", v))
-                    .json(&body)
-                    .send()
+        if url.len() > 1 {
+            Ok(select_ok(url.iter().map(|v| {
+                Box::pin(async move {
+                    let response = client
+                        .post(&format!("{}/api/v1/transactions", v))
+                        .json(body)
+                        .send()
+                        .await?;
+
+                    if let Some(v) = self.inner.broadcast_status {
+                        if response.status() == v {
+                            Ok(response)
+                        } else {
+                            Err(anyhow!(
+                                "Status code mismatch: expected {}, found {}",
+                                v,
+                                response.status()
+                            ))
+                        }
+                    } else {
+                        Ok(response)
+                    }
+                })
             }))
             .await?
             .0)
         } else {
             Ok(client
                 .post(&format!("{}/api/v1/transactions", url[0]))
-                .json(&body)
+                .json(body)
                 .send()
                 .await?)
         }
@@ -446,17 +596,9 @@ impl JitoClient {
         &self,
         tx: T,
     ) -> anyhow::Result<Response> {
-        let data = tx
-            .into_iter()
-            .map(|tx| {
-                Ok(BASE64_STANDARD.encode(
-                    bincode::serialize(&tx)
-                        .map_err(|v| anyhow::anyhow!("failed to serialize tx: {}", v))?,
-                ))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        let data = serialize_tx_vec(tx)?;
 
-        let body = json!({
+        let body = &json!({
             "id": 1,
             "jsonrpc": "2.0",
             "method": "sendBundle",
@@ -465,19 +607,36 @@ impl JitoClient {
 
         let (ref url, ref client) = *self.inner.lb.alloc().await;
 
-        if self.inner.broadcast {
-            Ok(futures::future::select_ok(url.iter().map(|v| {
-                client
-                    .post(&format!("{}/api/v1/bundles", v))
-                    .json(&body)
-                    .send()
+        if url.len() > 1 {
+            Ok(select_ok(url.iter().map(|v| {
+                Box::pin(async move {
+                    let response = client
+                        .post(&format!("{}/api/v1/bundles", v))
+                        .json(body)
+                        .send()
+                        .await?;
+
+                    if let Some(v) = self.inner.broadcast_status {
+                        if response.status() == v {
+                            Ok(response)
+                        } else {
+                            Err(anyhow!(
+                                "Status code mismatch: expected {}, found {}",
+                                v,
+                                response.status()
+                            ))
+                        }
+                    } else {
+                        Ok(response)
+                    }
+                })
             }))
             .await?
             .0)
         } else {
             Ok(client
                 .post(&format!("{}/api/v1/bundles", url[0]))
-                .json(&body)
+                .json(body)
                 .send()
                 .await?)
         }
@@ -508,9 +667,9 @@ impl JitoClient {
     {
         let (ref url, ref client) = *self.inner.lb.alloc().await;
 
-        let data = BASE64_STANDARD.encode(bincode::serialize(&tx.await?)?);
+        let data = serialize_tx(tx.await?)?;
 
-        let body = json!({
+        let body = &json!({
             "id": 1,
             "jsonrpc": "2.0",
             "method": "sendTransaction",
@@ -519,21 +678,38 @@ impl JitoClient {
             ]
         });
 
-        if self.inner.broadcast {
-            Ok(futures::future::select_ok(url.iter().map(|v| {
-                client
-                    .post(&format!("{}/api/v1/transactions", v))
-                    .query(&["bundleOnly", "true"])
-                    .json(&body)
-                    .send()
+        if url.len() > 1 {
+            Ok(select_ok(url.iter().map(|v| {
+                Box::pin(async move {
+                    let response = client
+                        .post(&format!("{}/api/v1/transactions", v))
+                        .query(&[("bundleOnly", "true")])
+                        .json(body)
+                        .send()
+                        .await?;
+
+                    if let Some(v) = self.inner.broadcast_status {
+                        if response.status() == v {
+                            Ok(response)
+                        } else {
+                            Err(anyhow!(
+                                "Status code mismatch: expected {}, found {}",
+                                v,
+                                response.status()
+                            ))
+                        }
+                    } else {
+                        Ok(response)
+                    }
+                })
             }))
             .await?
             .0)
         } else {
             Ok(client
                 .post(&format!("{}/api/v1/transactions", url[0]))
-                .query(&["bundleOnly", "true"])
-                .json(&body)
+                .query(&[("bundleOnly", "true")])
+                .json(body)
                 .send()
                 .await?)
         }
@@ -569,9 +745,9 @@ impl JitoClient {
     {
         let (ref url, ref client) = *self.inner.lb.alloc().await;
 
-        let data = BASE64_STANDARD.encode(bincode::serialize(&tx.await?)?);
+        let data = serialize_tx(tx.await?)?;
 
-        let body = json!({
+        let body = &json!({
             "id": 1,
             "jsonrpc": "2.0",
             "method": "sendTransaction",
@@ -580,19 +756,36 @@ impl JitoClient {
             ]
         });
 
-        if self.inner.broadcast {
-            Ok(futures::future::select_ok(url.iter().map(|v| {
-                client
-                    .post(&format!("{}/api/v1/transactions", v))
-                    .json(&body)
-                    .send()
+        if url.len() > 1 {
+            Ok(select_ok(url.iter().map(|v| {
+                Box::pin(async move {
+                    let response = client
+                        .post(&format!("{}/api/v1/transactions", v))
+                        .json(body)
+                        .send()
+                        .await?;
+
+                    if let Some(v) = self.inner.broadcast_status {
+                        if response.status() == v {
+                            Ok(response)
+                        } else {
+                            Err(anyhow!(
+                                "Status code mismatch: expected {}, found {}",
+                                v,
+                                response.status()
+                            ))
+                        }
+                    } else {
+                        Ok(response)
+                    }
+                })
             }))
             .await?
             .0)
         } else {
             Ok(client
                 .post(&format!("{}/api/v1/transactions", url[0]))
-                .json(&body)
+                .json(body)
                 .send()
                 .await?)
         }
@@ -609,37 +802,45 @@ impl JitoClient {
     {
         let (ref url, ref client) = *self.inner.lb.alloc().await;
 
-        let data = tx
-            .await?
-            .into_iter()
-            .map(|tx| {
-                Ok(BASE64_STANDARD.encode(
-                    bincode::serialize(&tx)
-                        .map_err(|v| anyhow::anyhow!("failed to serialize tx: {}", v))?,
-                ))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        let data = serialize_tx_vec(tx.await?)?;
 
-        let body = json!({
+        let body = &json!({
             "id": 1,
             "jsonrpc": "2.0",
             "method": "sendBundle",
             "params": [ data, { "encoding": "base64" } ]
         });
 
-        if self.inner.broadcast {
-            Ok(futures::future::select_ok(url.iter().map(|v| {
-                client
-                    .post(&format!("{}/api/v1/bundles", v))
-                    .json(&body)
-                    .send()
+        if url.len() > 1 {
+            Ok(select_ok(url.iter().map(|v| {
+                Box::pin(async move {
+                    let response = client
+                        .post(&format!("{}/api/v1/bundles", v))
+                        .json(body)
+                        .send()
+                        .await?;
+
+                    if let Some(v) = self.inner.broadcast_status {
+                        if response.status() == v {
+                            Ok(response)
+                        } else {
+                            Err(anyhow!(
+                                "Status code mismatch: expected {}, found {}",
+                                v,
+                                response.status()
+                            ))
+                        }
+                    } else {
+                        Ok(response)
+                    }
+                })
             }))
             .await?
             .0)
         } else {
             Ok(client
                 .post(&format!("{}/api/v1/bundles", url[0]))
-                .json(&body)
+                .json(body)
                 .send()
                 .await?)
         }
@@ -672,9 +873,9 @@ impl JitoClient {
     {
         let (ref url, ref client) = *self.inner.lb.alloc().await;
 
-        let data = BASE64_STANDARD.encode(bincode::serialize(&callback(url, client).await?)?);
+        let data = serialize_tx(callback(url, client).await?)?;
 
-        let body = json!({
+        let body = &json!({
             "id": 1,
             "jsonrpc": "2.0",
             "method": "sendTransaction",
@@ -683,21 +884,38 @@ impl JitoClient {
             ]
         });
 
-        if self.inner.broadcast {
-            Ok(futures::future::select_ok(url.iter().map(|v| {
-                client
-                    .post(&format!("{}/api/v1/transactions", v))
-                    .query(&["bundleOnly", "true"])
-                    .json(&body)
-                    .send()
+        if url.len() > 1 {
+            Ok(select_ok(url.iter().map(|v| {
+                Box::pin(async move {
+                    let response = client
+                        .post(&format!("{}/api/v1/transactions", v))
+                        .query(&[("bundleOnly", "true")])
+                        .json(body)
+                        .send()
+                        .await?;
+
+                    if let Some(v) = self.inner.broadcast_status {
+                        if response.status() == v {
+                            Ok(response)
+                        } else {
+                            Err(anyhow!(
+                                "Status code mismatch: expected {}, found {}",
+                                v,
+                                response.status()
+                            ))
+                        }
+                    } else {
+                        Ok(response)
+                    }
+                })
             }))
             .await?
             .0)
         } else {
             Ok(client
                 .post(&format!("{}/api/v1/transactions", url[0]))
-                .query(&["bundleOnly", "true"])
-                .json(&body)
+                .query(&[("bundleOnly", "true")])
+                .json(body)
                 .send()
                 .await?)
         }
@@ -732,9 +950,9 @@ impl JitoClient {
     {
         let (ref url, ref client) = *self.inner.lb.alloc().await;
 
-        let data = BASE64_STANDARD.encode(bincode::serialize(&callback(url, client).await?)?);
+        let data = serialize_tx(callback(url, client).await?)?;
 
-        let body = json!({
+        let body = &json!({
             "id": 1,
             "jsonrpc": "2.0",
             "method": "sendTransaction",
@@ -743,19 +961,36 @@ impl JitoClient {
             ]
         });
 
-        if self.inner.broadcast {
-            Ok(futures::future::select_ok(url.iter().map(|v| {
-                client
-                    .post(&format!("{}/api/v1/transactions", v))
-                    .json(&body)
-                    .send()
+        if url.len() > 1 {
+            Ok(select_ok(url.iter().map(|v| {
+                Box::pin(async move {
+                    let response = client
+                        .post(&format!("{}/api/v1/transactions", v))
+                        .json(body)
+                        .send()
+                        .await?;
+
+                    if let Some(v) = self.inner.broadcast_status {
+                        if response.status() == v {
+                            Ok(response)
+                        } else {
+                            Err(anyhow!(
+                                "Status code mismatch: expected {}, found {}",
+                                v,
+                                response.status()
+                            ))
+                        }
+                    } else {
+                        Ok(response)
+                    }
+                })
             }))
             .await?
             .0)
         } else {
             Ok(client
                 .post(&format!("{}/api/v1/transactions", url[0]))
-                .json(&body)
+                .json(body)
                 .send()
                 .await?)
         }
@@ -770,37 +1005,45 @@ impl JitoClient {
     {
         let (ref url, ref client) = *self.inner.lb.alloc().await;
 
-        let data = callback(url, client)
-            .await?
-            .into_iter()
-            .map(|tx| {
-                Ok(BASE64_STANDARD.encode(
-                    bincode::serialize(&tx)
-                        .map_err(|v| anyhow::anyhow!("failed to serialize tx: {}", v))?,
-                ))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        let data = serialize_tx_vec(callback(url, client).await?)?;
 
-        let body = json!({
+        let body = &json!({
             "id": 1,
             "jsonrpc": "2.0",
             "method": "sendBundle",
             "params": [ data, { "encoding": "base64" } ]
         });
 
-        if self.inner.broadcast {
-            Ok(futures::future::select_ok(url.iter().map(|v| {
-                client
-                    .post(&format!("{}/api/v1/bundles", v))
-                    .json(&body)
-                    .send()
+        if url.len() > 1 {
+            Ok(select_ok(url.iter().map(|v| {
+                Box::pin(async move {
+                    let response = client
+                        .post(&format!("{}/api/v1/bundles", v))
+                        .json(body)
+                        .send()
+                        .await?;
+
+                    if let Some(v) = self.inner.broadcast_status {
+                        if response.status() == v {
+                            Ok(response)
+                        } else {
+                            Err(anyhow!(
+                                "Status code mismatch: expected {}, found {}",
+                                v,
+                                response.status()
+                            ))
+                        }
+                    } else {
+                        Ok(response)
+                    }
+                })
             }))
             .await?
             .0)
         } else {
             Ok(client
                 .post(&format!("{}/api/v1/bundles", url[0]))
-                .json(&body)
+                .json(body)
                 .send()
                 .await?)
         }
