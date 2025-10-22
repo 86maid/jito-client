@@ -1070,7 +1070,7 @@ impl JitoClient {
     ///
     /// The task will only start executing once a permit is acquired from the semaphore.
     /// When the task completes, the permit is automatically released.
-    pub async fn spawn<F>(&self, future: F)
+    pub async fn spawn<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
@@ -1078,9 +1078,12 @@ impl JitoClient {
         let permit = self.inner.semaphore.clone().acquire_owned().await.unwrap();
 
         spawn(async move {
-            future.await;
+            let result = future.await;
+
             drop(permit);
-        });
+            
+            result
+        })
     }
 }
 
