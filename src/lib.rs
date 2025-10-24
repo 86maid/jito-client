@@ -249,7 +249,7 @@ impl JitoClient {
                             Ok(response)
                         } else {
                             Err(anyhow!(
-                                "Status code mismatch: expected {}, found {}",
+                                "status code mismatch: expected {}, found {}",
                                 v,
                                 response.status()
                             ))
@@ -289,7 +289,7 @@ impl JitoClient {
                             Ok(response)
                         } else {
                             Err(anyhow!(
-                                "Status code mismatch: expected {}, found {}",
+                                "status code mismatch: expected {}, found {}",
                                 v,
                                 response.status()
                             ))
@@ -328,7 +328,7 @@ impl JitoClient {
                             Ok(response)
                         } else {
                             Err(anyhow!(
-                                "Status code mismatch: expected {}, found {}",
+                                "status code mismatch: expected {}, found {}",
                                 v,
                                 response.status()
                             ))
@@ -369,7 +369,7 @@ impl JitoClient {
                             Ok(response)
                         } else {
                             Err(anyhow!(
-                                "Status code mismatch: expected {}, found {}",
+                                "status code mismatch: expected {}, found {}",
                                 v,
                                 response.status()
                             ))
@@ -408,7 +408,7 @@ impl JitoClient {
                             Ok(response)
                         } else {
                             Err(anyhow!(
-                                "Status code mismatch: expected {}, found {}",
+                                "status code mismatch: expected {}, found {}",
                                 v,
                                 response.status()
                             ))
@@ -452,7 +452,7 @@ impl JitoClient {
                             Ok(response)
                         } else {
                             Err(anyhow!(
-                                "Status code mismatch: expected {}, found {}",
+                                "status code mismatch: expected {}, found {}",
                                 v,
                                 response.status()
                             ))
@@ -503,7 +503,7 @@ impl JitoClient {
                             Ok(response)
                         } else {
                             Err(anyhow!(
-                                "Status code mismatch: expected {}, found {}",
+                                "status code mismatch: expected {}, found {}",
                                 v,
                                 response.status()
                             ))
@@ -570,7 +570,7 @@ impl JitoClient {
                             Ok(response)
                         } else {
                             Err(anyhow!(
-                                "Status code mismatch: expected {}, found {}",
+                                "status code mismatch: expected {}, found {}",
                                 v,
                                 response.status()
                             ))
@@ -621,7 +621,7 @@ impl JitoClient {
                             Ok(response)
                         } else {
                             Err(anyhow!(
-                                "Status code mismatch: expected {}, found {}",
+                                "status code mismatch: expected {}, found {}",
                                 v,
                                 response.status()
                             ))
@@ -693,7 +693,7 @@ impl JitoClient {
                             Ok(response)
                         } else {
                             Err(anyhow!(
-                                "Status code mismatch: expected {}, found {}",
+                                "status code mismatch: expected {}, found {}",
                                 v,
                                 response.status()
                             ))
@@ -770,7 +770,7 @@ impl JitoClient {
                             Ok(response)
                         } else {
                             Err(anyhow!(
-                                "Status code mismatch: expected {}, found {}",
+                                "status code mismatch: expected {}, found {}",
                                 v,
                                 response.status()
                             ))
@@ -825,7 +825,7 @@ impl JitoClient {
                             Ok(response)
                         } else {
                             Err(anyhow!(
-                                "Status code mismatch: expected {}, found {}",
+                                "status code mismatch: expected {}, found {}",
                                 v,
                                 response.status()
                             ))
@@ -899,7 +899,7 @@ impl JitoClient {
                             Ok(response)
                         } else {
                             Err(anyhow!(
-                                "Status code mismatch: expected {}, found {}",
+                                "status code mismatch: expected {}, found {}",
                                 v,
                                 response.status()
                             ))
@@ -975,7 +975,7 @@ impl JitoClient {
                             Ok(response)
                         } else {
                             Err(anyhow!(
-                                "Status code mismatch: expected {}, found {}",
+                                "status code mismatch: expected {}, found {}",
                                 v,
                                 response.status()
                             ))
@@ -1028,7 +1028,7 @@ impl JitoClient {
                             Ok(response)
                         } else {
                             Err(anyhow!(
-                                "Status code mismatch: expected {}, found {}",
+                                "status code mismatch: expected {}, found {}",
                                 v,
                                 response.status()
                             ))
@@ -1081,7 +1081,7 @@ impl JitoClient {
             let result = future.await;
 
             drop(permit);
-            
+
             result
         })
     }

@@ -841,9 +841,9 @@ checksum = "f5e54036fe321fd421e10d732f155734c4e4afd610dd556d9a82833ab3ee0bed"
 
 [[package]]
 name = "load-balancer"
-version = "0.4.3"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a502bcf3192d19de1c8a9d1f59dc155c6ec5b0d65eaa92a6555d1d105c60808"
+checksum = "32ca1bb71b4c89f8b3545df319577ec644a1aa8a87c7e998ac90081a722496b3"
 dependencies = [
  "anyhow",
  "async-trait",
