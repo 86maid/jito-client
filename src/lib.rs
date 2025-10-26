@@ -2,7 +2,7 @@ use anyhow::{Context, anyhow};
 use base64::prelude::*;
 use futures::future::{join_all, select_ok};
 use load_balancer::{LoadBalancer, interval::IntervalLoadBalancer};
-use reqwest::{Client, ClientBuilder, Response, StatusCode};
+use reqwest::{Client, ClientBuilder, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{net::IpAddr, sync::Arc, time::Duration};
@@ -13,6 +13,7 @@ pub use get_if_addrs::get_if_addrs;
 pub use load_balancer;
 pub use reqwest;
 pub use reqwest::Proxy;
+pub use reqwest::StatusCode;
 pub use reqwest::header::HeaderMap;
 pub use serde_json;
 
@@ -105,6 +106,8 @@ impl JitoClientBuilder {
         let semaphore = self.semaphore.unwrap_or(
             Semaphore::new(if self.interval == Duration::ZERO {
                 usize::MAX
+            } else if self.interval > Duration::from_secs(1) {
+                1
             } else {
                 Duration::from_secs(1).div_duration_f64(self.interval) as usize
             })

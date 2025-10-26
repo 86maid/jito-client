@@ -61,6 +61,7 @@ async fn main() {
   let client = JitoClientBuilder::new()
       // Broadcast each request to all configured URLs
       .broadcast(true)
+      .broadcast_status(StatusCode::OK)
       .interval(Duration::from_millis(1000))
       .ip(get_ipv4_list().unwrap())
       .url(&[
