@@ -117,13 +117,15 @@ impl JitoClientBuilder {
     /// Builds the `JitoClient` with the configured options.
     pub fn build(self) -> anyhow::Result<JitoClient> {
         let semaphore = self.semaphore.unwrap_or(
-            Semaphore::new(if self.interval == Duration::ZERO {
-                usize::MAX
-            } else if self.interval > Duration::from_secs(1) {
-                1
-            } else {
-                Duration::from_secs(1).div_duration_f64(self.interval) as usize
-            })
+            Semaphore::new(
+                if self.interval == Duration::ZERO {
+                    usize::MAX
+                } else if self.interval > Duration::from_secs(1) {
+                    1
+                } else {
+                    Duration::from_secs(1).div_duration_f64(self.interval) as usize
+                } * self.url.len(),
+            )
             .into(),
         );
 

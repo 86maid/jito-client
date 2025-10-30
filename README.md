@@ -111,7 +111,7 @@ async fn main() {
     // semaphore = 1000ms / interval = 25
     let client = JitoClientBuilder::new()
         .interval(Duration::from_millis(40))
-        // No need to set manually. defaults to 1000ms / interval
+        // No need to set manually. defaults to 1000ms / interval * url.len()
         // .semaphore(Arc::new(Semaphore::new(25)))
         .url(&[
             "https://amsterdam.mainnet.block-engine.jito.wtf",
