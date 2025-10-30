@@ -2,9 +2,10 @@ use anyhow::{Context, anyhow};
 use base64::prelude::*;
 use futures::future::{join_all, select_ok};
 use load_balancer::{LoadBalancer, interval::IntervalLoadBalancer};
+use reqwest::header::HeaderName;
 use reqwest::{Client, ClientBuilder, Response};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{net::IpAddr, sync::Arc, time::Duration};
 use tokio::spawn;
 use tokio::sync::Semaphore;
@@ -27,6 +28,7 @@ pub struct JitoClientBuilder {
     headers: Option<HeaderMap>,
     ip: Vec<IpAddr>,
     semaphore: Option<Arc<Semaphore>>,
+    headers_with_separator: Option<String>,
     broadcast_status: Option<StatusCode>,
 }
 
@@ -42,6 +44,7 @@ impl JitoClientBuilder {
             headers: None,
             ip: Vec::new(),
             semaphore: None,
+            headers_with_separator: None,
             broadcast_status: None,
         }
     }
@@ -60,8 +63,8 @@ impl JitoClientBuilder {
     }
 
     /// Sets the local IP addresses to bind outgoing requests to.
-    pub fn ip(mut self, ip: Vec<IpAddr>) -> Self {
-        self.ip = ip;
+    pub fn ip<T: IntoIterator<Item = IpAddr>>(mut self, ip: T) -> Self {
+        self.ip = ip.into_iter().collect();
         self
     }
 
@@ -98,6 +101,16 @@ impl JitoClientBuilder {
     /// Sets the status code considered successful in broadcast mode for select_ok.
     pub fn broadcast_status(mut self, broadcast_status: StatusCode) -> Self {
         self.broadcast_status = Some(broadcast_status);
+        self
+    }
+
+    /// Sets custom headers encoded in the URL using a separator.
+    ///
+    /// Example: `.headers_with_separator(":").url(&["https://google.com:key1=value1&key2=value2"])`
+    ///
+    /// parses `key1=value1&key2=value2` as headers.
+    pub fn headers_with_separator(mut self, headers_with_separator: impl AsRef<str>) -> Self {
+        self.headers_with_separator = Some(headers_with_separator.as_ref().to_string());
         self
     }
 
@@ -158,9 +171,10 @@ impl JitoClientBuilder {
             }
 
             JitoClientRef {
-                semaphore,
                 lb: IntervalLoadBalancer::new(entries),
+                semaphore,
                 broadcast_status: self.broadcast_status,
+                headers_with_separator: self.headers_with_separator,
             }
         } else {
             let mut entries = Vec::new();
@@ -208,9 +222,10 @@ impl JitoClientBuilder {
             }
 
             JitoClientRef {
-                semaphore,
                 lb: IntervalLoadBalancer::new(entries),
+                semaphore,
                 broadcast_status: self.broadcast_status,
+                headers_with_separator: self.headers_with_separator,
             }
         };
 
@@ -221,9 +236,10 @@ impl JitoClientBuilder {
 }
 
 struct JitoClientRef {
-    semaphore: Arc<Semaphore>,
     lb: IntervalLoadBalancer<Arc<(Vec<String>, Client)>>,
+    semaphore: Arc<Semaphore>,
     broadcast_status: Option<StatusCode>,
+    headers_with_separator: Option<String>,
 }
 
 /// Jito client for sending transactions and bundles.
@@ -239,13 +255,14 @@ impl JitoClient {
     }
 
     /// Sends a raw request.
-    pub async fn raw_send(&self, body: &serde_json::Value) -> anyhow::Result<Response> {
+    pub async fn raw_send(&self, body: &Value) -> anyhow::Result<Response> {
         let (ref url, ref client) = *self.inner.lb.alloc().await;
 
         if url.len() > 1 {
             Ok(select_ok(url.iter().map(|v| {
                 Box::pin(async move {
-                    let response = client.post(v).json(&body).send().await?;
+                    let (url, headers) = self.split_url(v)?;
+                    let response = client.post(url).headers(headers).json(&body).send().await?;
 
                     if let Some(v) = self.inner.broadcast_status {
                         if response.status() == v {
@@ -265,7 +282,8 @@ impl JitoClient {
             .await?
             .0)
         } else {
-            Ok(client.post(&url[0]).json(body).send().await?)
+            let (url, headers) = self.split_url(&url[0])?;
+            Ok(client.post(url).headers(headers).json(body).send().await?)
         }
     }
 
@@ -273,7 +291,7 @@ impl JitoClient {
     pub async fn raw_send_api(
         &self,
         api_url: impl AsRef<str>,
-        body: &serde_json::Value,
+        body: &Value,
     ) -> anyhow::Result<Response> {
         let (ref url, ref client) = *self.inner.lb.alloc().await;
         let api_url = api_url.as_ref();
@@ -281,8 +299,11 @@ impl JitoClient {
         if url.len() > 1 {
             Ok(select_ok(url.iter().map(|v| {
                 Box::pin(async move {
+                    let (base, headers) = self.split_url(v)?;
+                    let full_url = format!("{}{}", base, api_url);
                     let response = client
-                        .post(&format!("{}{}", v, api_url))
+                        .post(&full_url)
+                        .headers(headers)
                         .json(&body)
                         .send()
                         .await?;
@@ -305,8 +326,11 @@ impl JitoClient {
             .await?
             .0)
         } else {
+            let (base, headers) = self.split_url(&url[0])?;
+            let full_url = format!("{}{}", base, api_url);
             Ok(client
-                .post(&format!("{}{}", url[0], api_url))
+                .post(&full_url)
+                .headers(headers)
                 .json(body)
                 .send()
                 .await?)
@@ -316,7 +340,7 @@ impl JitoClient {
     /// Sends a raw request, with lazy body construction.
     pub async fn raw_send_lazy(
         &self,
-        body: impl Future<Output = anyhow::Result<serde_json::Value>>,
+        body: impl Future<Output = anyhow::Result<Value>>,
     ) -> anyhow::Result<Response> {
         let (ref url, ref client) = *self.inner.lb.alloc().await;
         let body = &body.await?;
@@ -324,7 +348,8 @@ impl JitoClient {
         if url.len() > 1 {
             Ok(select_ok(url.iter().map(|v| {
                 Box::pin(async move {
-                    let response = client.post(v).json(body).send().await?;
+                    let (url, headers) = self.split_url(v)?;
+                    let response = client.post(url).headers(headers).json(body).send().await?;
 
                     if let Some(v) = self.inner.broadcast_status {
                         if response.status() == v {
@@ -344,7 +369,8 @@ impl JitoClient {
             .await?
             .0)
         } else {
-            Ok(client.post(&url[0]).json(body).send().await?)
+            let (url, headers) = self.split_url(&url[0])?;
+            Ok(client.post(url).headers(headers).json(body).send().await?)
         }
     }
 
@@ -352,7 +378,7 @@ impl JitoClient {
     pub async fn raw_send_api_lazy(
         &self,
         api_url: impl AsRef<str>,
-        body: impl Future<Output = anyhow::Result<serde_json::Value>>,
+        body: impl Future<Output = anyhow::Result<Value>>,
     ) -> anyhow::Result<Response> {
         let (ref url, ref client) = *self.inner.lb.alloc().await;
         let api_url = api_url.as_ref();
@@ -361,8 +387,11 @@ impl JitoClient {
         if url.len() > 1 {
             Ok(select_ok(url.iter().map(|v| {
                 Box::pin(async move {
+                    let (base, headers) = self.split_url(v)?;
+                    let full_url = format!("{}{}", base, api_url);
                     let response = client
-                        .post(&format!("{}{}", v, api_url))
+                        .post(&full_url)
+                        .headers(headers)
                         .json(&body)
                         .send()
                         .await?;
@@ -385,8 +414,11 @@ impl JitoClient {
             .await?
             .0)
         } else {
+            let (base, headers) = self.split_url(&url[0])?;
+            let full_url = format!("{}{}", base, api_url);
             Ok(client
-                .post(&format!("{}{}", url[0], api_url))
+                .post(&full_url)
+                .headers(headers)
                 .json(&body)
                 .send()
                 .await?)
@@ -396,7 +428,7 @@ impl JitoClient {
     /// Sends a raw request, with lazy function to build the body.
     pub async fn raw_send_lazy_fn<F>(&self, callback: F) -> anyhow::Result<Response>
     where
-        F: AsyncFnOnce(&Vec<String>, &Client) -> anyhow::Result<serde_json::Value>,
+        F: AsyncFnOnce(&Vec<String>, &Client) -> anyhow::Result<Value>,
     {
         let (ref url, ref client) = *self.inner.lb.alloc().await;
         let body = &callback(url, client).await?;
@@ -404,7 +436,8 @@ impl JitoClient {
         if url.len() > 1 {
             Ok(select_ok(url.iter().map(|v| {
                 Box::pin(async move {
-                    let response = client.post(v).json(body).send().await?;
+                    let (url, headers) = self.split_url(v)?;
+                    let response = client.post(url).headers(headers).json(body).send().await?;
 
                     if let Some(v) = self.inner.broadcast_status {
                         if response.status() == v {
@@ -424,7 +457,8 @@ impl JitoClient {
             .await?
             .0)
         } else {
-            Ok(client.post(&url[0]).json(body).send().await?)
+            let (url, headers) = self.split_url(&url[0])?;
+            Ok(client.post(url).headers(headers).json(body).send().await?)
         }
     }
 
@@ -435,7 +469,7 @@ impl JitoClient {
         callback: F,
     ) -> anyhow::Result<Response>
     where
-        F: AsyncFnOnce(&Vec<String>, &Client) -> anyhow::Result<serde_json::Value>,
+        F: AsyncFnOnce(&Vec<String>, &Client) -> anyhow::Result<Value>,
     {
         let (ref url, ref client) = *self.inner.lb.alloc().await;
         let api_url = api_url.as_ref();
@@ -444,8 +478,11 @@ impl JitoClient {
         if url.len() > 1 {
             Ok(select_ok(url.iter().map(|v| {
                 Box::pin(async move {
+                    let (base, headers) = self.split_url(v)?;
+                    let full_url = format!("{}{}", base, api_url);
                     let response = client
-                        .post(&format!("{}{}", v, api_url))
+                        .post(&full_url)
+                        .headers(headers)
                         .json(body)
                         .send()
                         .await?;
@@ -468,8 +505,11 @@ impl JitoClient {
             .await?
             .0)
         } else {
+            let (base, headers) = self.split_url(&url[0])?;
+            let full_url = format!("{}{}", base, api_url);
             Ok(client
-                .post(&format!("{}{}", url[0], api_url))
+                .post(&full_url)
+                .headers(headers)
                 .json(body)
                 .send()
                 .await?)
@@ -494,8 +534,11 @@ impl JitoClient {
         if url.len() > 1 {
             Ok(select_ok(url.iter().map(|v| {
                 Box::pin(async move {
+                    let (base, headers) = self.split_url(v)?;
+                    let full_url = format!("{}/api/v1/transactions", base);
                     let response = client
-                        .post(&format!("{}/api/v1/transactions", v))
+                        .post(&full_url)
+                        .headers(headers)
                         .query(&[("bundleOnly", "true")])
                         .json(body)
                         .send()
@@ -519,8 +562,11 @@ impl JitoClient {
             .await?
             .0)
         } else {
+            let (base, headers) = self.split_url(&url[0])?;
+            let full_url = format!("{}/api/v1/transactions", base);
             Ok(client
-                .post(&format!("{}/api/v1/transactions", url[0]))
+                .post(&full_url)
+                .headers(headers)
                 .query(&[("bundleOnly", "true")])
                 .json(body)
                 .send()
@@ -562,8 +608,11 @@ impl JitoClient {
         if url.len() > 1 {
             Ok(select_ok(url.iter().map(|v| {
                 Box::pin(async move {
+                    let (base, headers) = self.split_url(v)?;
+                    let full_url = format!("{}/api/v1/transactions", base);
                     let response = client
-                        .post(&format!("{}/api/v1/transactions", v))
+                        .post(&full_url)
+                        .headers(headers)
                         .json(body)
                         .send()
                         .await?;
@@ -586,8 +635,11 @@ impl JitoClient {
             .await?
             .0)
         } else {
+            let (base, headers) = self.split_url(&url[0])?;
+            let full_url = format!("{}/api/v1/transactions", base);
             Ok(client
-                .post(&format!("{}/api/v1/transactions", url[0]))
+                .post(&full_url)
+                .headers(headers)
                 .json(body)
                 .send()
                 .await?)
@@ -613,8 +665,11 @@ impl JitoClient {
         if url.len() > 1 {
             Ok(select_ok(url.iter().map(|v| {
                 Box::pin(async move {
+                    let (base, headers) = self.split_url(v)?;
+                    let full_url = format!("{}/api/v1/bundles", base);
                     let response = client
-                        .post(&format!("{}/api/v1/bundles", v))
+                        .post(&full_url)
+                        .headers(headers)
                         .json(body)
                         .send()
                         .await?;
@@ -637,8 +692,11 @@ impl JitoClient {
             .await?
             .0)
         } else {
+            let (base, headers) = self.split_url(&url[0])?;
+            let full_url = format!("{}/api/v1/bundles", base);
             Ok(client
-                .post(&format!("{}/api/v1/bundles", url[0]))
+                .post(&full_url)
+                .headers(headers)
                 .json(body)
                 .send()
                 .await?)
@@ -653,7 +711,7 @@ impl JitoClient {
         self.send_bundle(tx)
             .await?
             .error_for_status()?
-            .json::<serde_json::Value>()
+            .json::<Value>()
             .await?["result"]
             .as_str()
             .map(|v| v.to_string())
@@ -684,8 +742,11 @@ impl JitoClient {
         if url.len() > 1 {
             Ok(select_ok(url.iter().map(|v| {
                 Box::pin(async move {
+                    let (base, headers) = self.split_url(v)?;
+                    let full_url = format!("{}/api/v1/transactions", base);
                     let response = client
-                        .post(&format!("{}/api/v1/transactions", v))
+                        .post(&full_url)
+                        .headers(headers)
                         .query(&[("bundleOnly", "true")])
                         .json(body)
                         .send()
@@ -709,8 +770,11 @@ impl JitoClient {
             .await?
             .0)
         } else {
+            let (base, headers) = self.split_url(&url[0])?;
+            let full_url = format!("{}/api/v1/transactions", base);
             Ok(client
-                .post(&format!("{}/api/v1/transactions", url[0]))
+                .post(&full_url)
+                .headers(headers)
                 .query(&[("bundleOnly", "true")])
                 .json(body)
                 .send()
@@ -762,8 +826,11 @@ impl JitoClient {
         if url.len() > 1 {
             Ok(select_ok(url.iter().map(|v| {
                 Box::pin(async move {
+                    let (base, headers) = self.split_url(v)?;
+                    let full_url = format!("{}/api/v1/transactions", base);
                     let response = client
-                        .post(&format!("{}/api/v1/transactions", v))
+                        .post(&full_url)
+                        .headers(headers)
                         .json(body)
                         .send()
                         .await?;
@@ -786,8 +853,11 @@ impl JitoClient {
             .await?
             .0)
         } else {
+            let (base, headers) = self.split_url(&url[0])?;
+            let full_url = format!("{}/api/v1/transactions", base);
             Ok(client
-                .post(&format!("{}/api/v1/transactions", url[0]))
+                .post(&full_url)
+                .headers(headers)
                 .json(body)
                 .send()
                 .await?)
@@ -817,8 +887,11 @@ impl JitoClient {
         if url.len() > 1 {
             Ok(select_ok(url.iter().map(|v| {
                 Box::pin(async move {
+                    let (base, headers) = self.split_url(v)?;
+                    let full_url = format!("{}/api/v1/bundles", base);
                     let response = client
-                        .post(&format!("{}/api/v1/bundles", v))
+                        .post(&full_url)
+                        .headers(headers)
                         .json(body)
                         .send()
                         .await?;
@@ -841,8 +914,11 @@ impl JitoClient {
             .await?
             .0)
         } else {
+            let (base, headers) = self.split_url(&url[0])?;
+            let full_url = format!("{}/api/v1/bundles", base);
             Ok(client
-                .post(&format!("{}/api/v1/bundles", url[0]))
+                .post(&full_url)
+                .headers(headers)
                 .json(body)
                 .send()
                 .await?)
@@ -861,7 +937,7 @@ impl JitoClient {
         self.send_bundle_lazy(tx)
             .await?
             .error_for_status()?
-            .json::<serde_json::Value>()
+            .json::<Value>()
             .await?["result"]
             .as_str()
             .map(|v| v.to_string())
@@ -890,8 +966,11 @@ impl JitoClient {
         if url.len() > 1 {
             Ok(select_ok(url.iter().map(|v| {
                 Box::pin(async move {
+                    let (base, headers) = self.split_url(v)?;
+                    let full_url = format!("{}/api/v1/transactions", base);
                     let response = client
-                        .post(&format!("{}/api/v1/transactions", v))
+                        .post(&full_url)
+                        .headers(headers)
                         .query(&[("bundleOnly", "true")])
                         .json(body)
                         .send()
@@ -915,8 +994,11 @@ impl JitoClient {
             .await?
             .0)
         } else {
+            let (base, headers) = self.split_url(&url[0])?;
+            let full_url = format!("{}/api/v1/transactions", base);
             Ok(client
-                .post(&format!("{}/api/v1/transactions", url[0]))
+                .post(&full_url)
+                .headers(headers)
                 .query(&[("bundleOnly", "true")])
                 .json(body)
                 .send()
@@ -967,8 +1049,11 @@ impl JitoClient {
         if url.len() > 1 {
             Ok(select_ok(url.iter().map(|v| {
                 Box::pin(async move {
+                    let (base, headers) = self.split_url(v)?;
+                    let full_url = format!("{}/api/v1/transactions", base);
                     let response = client
-                        .post(&format!("{}/api/v1/transactions", v))
+                        .post(&full_url)
+                        .headers(headers)
                         .json(body)
                         .send()
                         .await?;
@@ -991,8 +1076,11 @@ impl JitoClient {
             .await?
             .0)
         } else {
+            let (base, headers) = self.split_url(&url[0])?;
+            let full_url = format!("{}/api/v1/transactions", base);
             Ok(client
-                .post(&format!("{}/api/v1/transactions", url[0]))
+                .post(&full_url)
+                .headers(headers)
                 .json(body)
                 .send()
                 .await?)
@@ -1020,8 +1108,11 @@ impl JitoClient {
         if url.len() > 1 {
             Ok(select_ok(url.iter().map(|v| {
                 Box::pin(async move {
+                    let (base, headers) = self.split_url(v)?;
+                    let full_url = format!("{}/api/v1/bundles", base);
                     let response = client
-                        .post(&format!("{}/api/v1/bundles", v))
+                        .post(&full_url)
+                        .headers(headers)
                         .json(body)
                         .send()
                         .await?;
@@ -1044,8 +1135,11 @@ impl JitoClient {
             .await?
             .0)
         } else {
+            let (base, headers) = self.split_url(&url[0])?;
+            let full_url = format!("{}/api/v1/bundles", base);
             Ok(client
-                .post(&format!("{}/api/v1/bundles", url[0]))
+                .post(&full_url)
+                .headers(headers)
                 .json(body)
                 .send()
                 .await?)
@@ -1062,7 +1156,7 @@ impl JitoClient {
         self.send_bundle_lazy_fn(callback)
             .await?
             .error_for_status()?
-            .json::<serde_json::Value>()
+            .json::<Value>()
             .await?["result"]
             .as_str()
             .map(|v| v.to_string())
@@ -1087,6 +1181,22 @@ impl JitoClient {
 
             result
         })
+    }
+
+    fn split_url<'a>(&'a self, url: &'a str) -> anyhow::Result<(&'a str, HeaderMap)> {
+        let mut headers = HeaderMap::new();
+
+        if let Some(v) = &self.inner.headers_with_separator {
+            if let Some((a, b)) = url.split_once(v) {
+                for (k, v) in form_urlencoded::parse(b.as_bytes()) {
+                    headers.insert(HeaderName::from_bytes(k.as_bytes())?, v.parse()?);
+                }
+
+                return Ok((a, headers));
+            }
+        }
+
+        Ok((url, headers))
     }
 }
 
@@ -1117,7 +1227,7 @@ pub async fn get_jito_tip(client: Client) -> anyhow::Result<JitoTip> {
 /// Represents the result of querying bundle statuses.
 #[derive(Debug, Deserialize)]
 pub struct BundleResult {
-    pub context: serde_json::Value,
+    pub context: Value,
     pub value: Option<Vec<BundleStatus>>,
 }
 
@@ -1127,7 +1237,7 @@ pub struct BundleStatus {
     pub transactions: Option<Vec<String>>,
     pub slot: Option<u64>,
     pub confirmation_status: Option<String>,
-    pub err: Option<serde_json::Value>,
+    pub err: Option<Value>,
 }
 
 /// Fetches statuses of multiple bundles.
@@ -1167,7 +1277,7 @@ pub struct InflightBundleStatus {
 
 #[derive(Debug, Deserialize)]
 pub struct InflightBundleResult {
-    pub context: serde_json::Value,
+    pub context: Value,
     pub value: Option<Vec<InflightBundleStatus>>,
 }
 
@@ -1266,11 +1376,6 @@ pub fn serialize_tx_vec<T: IntoIterator<Item = impl Serialize>>(
     tx: T,
 ) -> anyhow::Result<Vec<String>> {
     tx.into_iter()
-        .map(|tx| {
-            Ok(BASE64_STANDARD.encode(
-                bincode::serialize(&tx)
-                    .map_err(|v| anyhow::anyhow!("failed to serialize tx: {}", v))?,
-            ))
-        })
+        .map(|tx| Ok(BASE64_STANDARD.encode(bincode::serialize(&tx)?)))
         .collect::<anyhow::Result<Vec<_>>>()
 }
