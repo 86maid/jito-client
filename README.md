@@ -89,16 +89,16 @@ async fn main() {
     //
     // Example: 
     // 
-    //   .headers_with_separator(":")
-    //   .url(&["https://google.com:key1=value1&key2=value2"])
+    //   .headers_with_separator("~")
+    //   .url(&["https://google.com~key1=value1&key2=value2"])
     //
     // parses `key1=value1&key2=value2` as headers.
     let client = JitoClientBuilder::new()
-        .headers_with_separator(":")
+        .headers_with_separator("~")
         .url(&[
-            "https://amsterdam.mainnet.block-engine.jito.wtf:auth=123",
-            "https://tokyo.mainnet.block-engine.jito.wtf:auth=123",
-            "https://london.mainnet.block-engine.jito.wtf:auth=123",
+            "https://amsterdam.mainnet.block-engine.jito.wtf~auth=123",
+            "https://tokyo.mainnet.block-engine.jito.wtf~auth=123",
+            "https://london.mainnet.block-engine.jito.wtf~auth=123",
         ])
         .build()
         .unwrap();
