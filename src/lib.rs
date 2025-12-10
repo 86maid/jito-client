@@ -224,6 +224,7 @@ pub struct JitoClient {
     inner: Arc<JitoClientRef>,
 }
 
+#[derive(Clone)]
 pub struct JitoClientOnce {
     inner: Arc<JitoClientRef>,
     entry: Arc<(Vec<String>, Client)>,
