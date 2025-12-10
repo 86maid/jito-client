@@ -7,8 +7,6 @@ use reqwest::{Client, ClientBuilder, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{net::IpAddr, sync::Arc, time::Duration};
-use tokio::spawn;
-use tokio::sync::Semaphore;
 
 pub use get_if_addrs::get_if_addrs;
 pub use load_balancer;
@@ -27,7 +25,6 @@ pub struct JitoClientBuilder {
     proxy: Option<Proxy>,
     headers: Option<HeaderMap>,
     ip: Vec<IpAddr>,
-    semaphore: Option<Arc<Semaphore>>,
     headers_with_separator: Option<String>,
     broadcast_status: Option<StatusCode>,
 }
@@ -43,7 +40,6 @@ impl JitoClientBuilder {
             proxy: None,
             headers: None,
             ip: Vec::new(),
-            semaphore: None,
             headers_with_separator: None,
             broadcast_status: None,
         }
@@ -92,12 +88,6 @@ impl JitoClientBuilder {
         self
     }
 
-    /// Sets semaphore for the client.
-    pub fn semaphore(mut self, semaphore: Arc<Semaphore>) -> Self {
-        self.semaphore = Some(semaphore);
-        self
-    }
-
     /// Sets the status code considered successful in broadcast mode for select_ok.
     pub fn broadcast_status(mut self, broadcast_status: StatusCode) -> Self {
         self.broadcast_status = Some(broadcast_status);
@@ -116,19 +106,6 @@ impl JitoClientBuilder {
 
     /// Builds the `JitoClient` with the configured options.
     pub fn build(self) -> anyhow::Result<JitoClient> {
-        let semaphore = self.semaphore.unwrap_or(
-            Semaphore::new(if self.interval == Duration::ZERO {
-                usize::MAX
-            } else if self.broadcast {
-                1
-            } else {
-                let per_second = (1.0 / self.interval.as_secs_f64()) * self.url.len() as f64;
-
-                self.url.len().max(per_second.ceil() as usize)
-            })
-            .into(),
-        );
-
         let default_ip = self.ip.is_empty();
 
         let inner = if self.broadcast {
@@ -174,7 +151,6 @@ impl JitoClientBuilder {
 
             JitoClientRef {
                 lb: IntervalLoadBalancer::new(entries),
-                semaphore,
                 broadcast_status: self.broadcast_status,
                 headers_with_separator: self.headers_with_separator,
             }
@@ -225,7 +201,6 @@ impl JitoClientBuilder {
 
             JitoClientRef {
                 lb: IntervalLoadBalancer::new(entries),
-                semaphore,
                 broadcast_status: self.broadcast_status,
                 headers_with_separator: self.headers_with_separator,
             }
@@ -239,7 +214,6 @@ impl JitoClientBuilder {
 
 struct JitoClientRef {
     lb: IntervalLoadBalancer<Arc<(Vec<String>, Client)>>,
-    semaphore: Arc<Semaphore>,
     broadcast_status: Option<StatusCode>,
     headers_with_separator: Option<String>,
 }
@@ -250,15 +224,31 @@ pub struct JitoClient {
     inner: Arc<JitoClientRef>,
 }
 
-impl JitoClient {
-    /// Creates a new client with default settings.
-    pub fn new() -> Self {
-        JitoClientBuilder::new().build().unwrap()
+pub struct JitoClientOnce {
+    inner: Arc<JitoClientRef>,
+    entry: Arc<(Vec<String>, Client)>,
+}
+
+impl JitoClientOnce {
+    fn split_url<'a>(&'a self, url: &'a str) -> anyhow::Result<(&'a str, HeaderMap)> {
+        let mut headers = HeaderMap::new();
+
+        if let Some(v) = &self.inner.headers_with_separator {
+            if let Some((a, b)) = url.split_once(v) {
+                for (k, v) in form_urlencoded::parse(b.as_bytes()) {
+                    headers.insert(HeaderName::from_bytes(k.as_bytes())?, v.parse()?);
+                }
+
+                return Ok((a, headers));
+            }
+        }
+
+        Ok((url, headers))
     }
 
     /// Sends a raw request.
     pub async fn raw_send(&self, body: &Value) -> anyhow::Result<Response> {
-        let (ref url, ref client) = *self.inner.lb.alloc().await;
+        let (ref url, ref client) = *self.entry;
 
         if url.len() > 1 {
             Ok(select_ok(url.iter().map(|v| {
@@ -285,6 +275,7 @@ impl JitoClient {
             .0)
         } else {
             let (url, headers) = self.split_url(&url[0])?;
+
             Ok(client.post(url).headers(headers).json(body).send().await?)
         }
     }
@@ -295,7 +286,7 @@ impl JitoClient {
         api_url: impl AsRef<str>,
         body: &Value,
     ) -> anyhow::Result<Response> {
-        let (ref url, ref client) = *self.inner.lb.alloc().await;
+        let (ref url, ref client) = *self.entry;
         let api_url = api_url.as_ref();
 
         if url.len() > 1 {
@@ -330,185 +321,7 @@ impl JitoClient {
         } else {
             let (base, headers) = self.split_url(&url[0])?;
             let full_url = format!("{}{}", base, api_url);
-            Ok(client
-                .post(&full_url)
-                .headers(headers)
-                .json(body)
-                .send()
-                .await?)
-        }
-    }
 
-    /// Sends a raw request, with lazy body construction.
-    pub async fn raw_send_lazy(
-        &self,
-        body: impl Future<Output = anyhow::Result<Value>>,
-    ) -> anyhow::Result<Response> {
-        let (ref url, ref client) = *self.inner.lb.alloc().await;
-        let body = &body.await?;
-
-        if url.len() > 1 {
-            Ok(select_ok(url.iter().map(|v| {
-                Box::pin(async move {
-                    let (url, headers) = self.split_url(v)?;
-                    let response = client.post(url).headers(headers).json(body).send().await?;
-
-                    if let Some(v) = self.inner.broadcast_status {
-                        if response.status() == v {
-                            Ok(response)
-                        } else {
-                            Err(anyhow!(
-                                "status code mismatch: expected {}, found {}",
-                                v,
-                                response.status()
-                            ))
-                        }
-                    } else {
-                        Ok(response)
-                    }
-                })
-            }))
-            .await?
-            .0)
-        } else {
-            let (url, headers) = self.split_url(&url[0])?;
-            Ok(client.post(url).headers(headers).json(body).send().await?)
-        }
-    }
-
-    /// Sends a raw request, use base_url + api_url, with lazy body construction.
-    pub async fn raw_send_api_lazy(
-        &self,
-        api_url: impl AsRef<str>,
-        body: impl Future<Output = anyhow::Result<Value>>,
-    ) -> anyhow::Result<Response> {
-        let (ref url, ref client) = *self.inner.lb.alloc().await;
-        let api_url = api_url.as_ref();
-        let body = &body.await?;
-
-        if url.len() > 1 {
-            Ok(select_ok(url.iter().map(|v| {
-                Box::pin(async move {
-                    let (base, headers) = self.split_url(v)?;
-                    let full_url = format!("{}{}", base, api_url);
-                    let response = client
-                        .post(&full_url)
-                        .headers(headers)
-                        .json(&body)
-                        .send()
-                        .await?;
-
-                    if let Some(v) = self.inner.broadcast_status {
-                        if response.status() == v {
-                            Ok(response)
-                        } else {
-                            Err(anyhow!(
-                                "status code mismatch: expected {}, found {}",
-                                v,
-                                response.status()
-                            ))
-                        }
-                    } else {
-                        Ok(response)
-                    }
-                })
-            }))
-            .await?
-            .0)
-        } else {
-            let (base, headers) = self.split_url(&url[0])?;
-            let full_url = format!("{}{}", base, api_url);
-            Ok(client
-                .post(&full_url)
-                .headers(headers)
-                .json(&body)
-                .send()
-                .await?)
-        }
-    }
-
-    /// Sends a raw request, with lazy function to build the body.
-    pub async fn raw_send_lazy_fn<F>(&self, callback: F) -> anyhow::Result<Response>
-    where
-        F: AsyncFnOnce(&Vec<String>, &Client) -> anyhow::Result<Value>,
-    {
-        let (ref url, ref client) = *self.inner.lb.alloc().await;
-        let body = &callback(url, client).await?;
-
-        if url.len() > 1 {
-            Ok(select_ok(url.iter().map(|v| {
-                Box::pin(async move {
-                    let (url, headers) = self.split_url(v)?;
-                    let response = client.post(url).headers(headers).json(body).send().await?;
-
-                    if let Some(v) = self.inner.broadcast_status {
-                        if response.status() == v {
-                            Ok(response)
-                        } else {
-                            Err(anyhow!(
-                                "status code mismatch: expected {}, found {}",
-                                v,
-                                response.status()
-                            ))
-                        }
-                    } else {
-                        Ok(response)
-                    }
-                })
-            }))
-            .await?
-            .0)
-        } else {
-            let (url, headers) = self.split_url(&url[0])?;
-            Ok(client.post(url).headers(headers).json(body).send().await?)
-        }
-    }
-
-    /// Sends a raw request, use base_url + api_url, with lazy function to build the body.
-    pub async fn raw_send_api_lazy_fn<F>(
-        &self,
-        api_url: impl AsRef<str>,
-        callback: F,
-    ) -> anyhow::Result<Response>
-    where
-        F: AsyncFnOnce(&Vec<String>, &Client) -> anyhow::Result<Value>,
-    {
-        let (ref url, ref client) = *self.inner.lb.alloc().await;
-        let api_url = api_url.as_ref();
-        let body = &callback(url, client).await?;
-
-        if url.len() > 1 {
-            Ok(select_ok(url.iter().map(|v| {
-                Box::pin(async move {
-                    let (base, headers) = self.split_url(v)?;
-                    let full_url = format!("{}{}", base, api_url);
-                    let response = client
-                        .post(&full_url)
-                        .headers(headers)
-                        .json(body)
-                        .send()
-                        .await?;
-
-                    if let Some(v) = self.inner.broadcast_status {
-                        if response.status() == v {
-                            Ok(response)
-                        } else {
-                            Err(anyhow!(
-                                "status code mismatch: expected {}, found {}",
-                                v,
-                                response.status()
-                            ))
-                        }
-                    } else {
-                        Ok(response)
-                    }
-                })
-            }))
-            .await?
-            .0)
-        } else {
-            let (base, headers) = self.split_url(&url[0])?;
-            let full_url = format!("{}{}", base, api_url);
             Ok(client
                 .post(&full_url)
                 .headers(headers)
@@ -531,7 +344,7 @@ impl JitoClient {
             ]
         });
 
-        let (ref url, ref client) = *self.inner.lb.alloc().await;
+        let (ref url, ref client) = *self.entry;
 
         if url.len() > 1 {
             Ok(select_ok(url.iter().map(|v| {
@@ -566,6 +379,7 @@ impl JitoClient {
         } else {
             let (base, headers) = self.split_url(&url[0])?;
             let full_url = format!("{}/api/v1/transactions", base);
+
             Ok(client
                 .post(&full_url)
                 .headers(headers)
@@ -605,7 +419,7 @@ impl JitoClient {
             ]
         });
 
-        let (ref url, ref client) = *self.inner.lb.alloc().await;
+        let (ref url, ref client) = *self.entry;
 
         if url.len() > 1 {
             Ok(select_ok(url.iter().map(|v| {
@@ -639,6 +453,7 @@ impl JitoClient {
         } else {
             let (base, headers) = self.split_url(&url[0])?;
             let full_url = format!("{}/api/v1/transactions", base);
+
             Ok(client
                 .post(&full_url)
                 .headers(headers)
@@ -662,7 +477,7 @@ impl JitoClient {
             "params": [ data, { "encoding": "base64" } ]
         });
 
-        let (ref url, ref client) = *self.inner.lb.alloc().await;
+        let (ref url, ref client) = *self.entry;
 
         if url.len() > 1 {
             Ok(select_ok(url.iter().map(|v| {
@@ -696,6 +511,7 @@ impl JitoClient {
         } else {
             let (base, headers) = self.split_url(&url[0])?;
             let full_url = format!("{}/api/v1/bundles", base);
+
             Ok(client
                 .post(&full_url)
                 .headers(headers)
@@ -719,486 +535,68 @@ impl JitoClient {
             .map(|v| v.to_string())
             .ok_or_else(|| anyhow::anyhow!("missing bundle result"))
     }
+}
 
-    /// Sends a single transaction and returns the HTTP response, with lazy serialization.
-    pub async fn send_transaction_lazy<T>(
+impl JitoClient {
+    /// Creates a new client with default settings.
+    pub fn new() -> Self {
+        JitoClientBuilder::new().build().unwrap()
+    }
+
+    // Alloc a new client with Load Balancer.
+    pub async fn alloc(&self) -> JitoClientOnce {
+        JitoClientOnce {
+            inner: self.inner.clone(),
+            entry: self.inner.lb.alloc().await,
+        }
+    }
+
+    /// Sends a raw request.
+    pub async fn raw_send(&self, body: &Value) -> anyhow::Result<Response> {
+        self.alloc().await.raw_send(body).await
+    }
+
+    /// Sends a raw request, use base_url + api_url.
+    pub async fn raw_send_api(
         &self,
-        tx: impl Future<Output = anyhow::Result<T>>,
-    ) -> anyhow::Result<Response>
-    where
-        T: Serialize,
-    {
-        let (ref url, ref client) = *self.inner.lb.alloc().await;
-
-        let data = serialize_tx(tx.await?)?;
-
-        let body = &json!({
-            "id": 1,
-            "jsonrpc": "2.0",
-            "method": "sendTransaction",
-            "params": [
-                data, { "encoding": "base64" }
-            ]
-        });
-
-        if url.len() > 1 {
-            Ok(select_ok(url.iter().map(|v| {
-                Box::pin(async move {
-                    let (base, headers) = self.split_url(v)?;
-                    let full_url = format!("{}/api/v1/transactions", base);
-                    let response = client
-                        .post(&full_url)
-                        .headers(headers)
-                        .query(&[("bundleOnly", "true")])
-                        .json(body)
-                        .send()
-                        .await?;
-
-                    if let Some(v) = self.inner.broadcast_status {
-                        if response.status() == v {
-                            Ok(response)
-                        } else {
-                            Err(anyhow!(
-                                "status code mismatch: expected {}, found {}",
-                                v,
-                                response.status()
-                            ))
-                        }
-                    } else {
-                        Ok(response)
-                    }
-                })
-            }))
-            .await?
-            .0)
-        } else {
-            let (base, headers) = self.split_url(&url[0])?;
-            let full_url = format!("{}/api/v1/transactions", base);
-            Ok(client
-                .post(&full_url)
-                .headers(headers)
-                .query(&[("bundleOnly", "true")])
-                .json(body)
-                .send()
-                .await?)
-        }
+        api_url: impl AsRef<str>,
+        body: &Value,
+    ) -> anyhow::Result<Response> {
+        self.alloc().await.raw_send_api(api_url, body).await
     }
 
-    /// Sends a transaction and returns the bundle ID from the response headers, with lazy serialization.
-    pub async fn send_transaction_bid_lazy<T>(
+    /// Sends a single transaction and returns the HTTP response.
+    pub async fn send_transaction(&self, tx: impl Serialize) -> anyhow::Result<Response> {
+        self.alloc().await.send_transaction(tx).await
+    }
+
+    /// Sends a transaction and returns the bundle ID from the response headers.
+    pub async fn send_transaction_bid(&self, tx: impl Serialize) -> anyhow::Result<String> {
+        self.alloc().await.send_transaction_bid(tx).await
+    }
+
+    /// Sends a transaction without `bundleOnly` flag.
+    pub async fn send_transaction_no_bundle_only(
         &self,
-        tx: impl Future<Output = anyhow::Result<T>>,
-    ) -> anyhow::Result<String>
-    where
-        T: Serialize,
-    {
-        Ok(self
-            .send_transaction_lazy(tx)
-            .await?
-            .error_for_status()?
-            .headers()
-            .get("x-bundle-id")
-            .ok_or_else(|| anyhow!("missing `x-bundle-id` header"))?
-            .to_str()
-            .map_err(|v| anyhow!("invalid `x-bundle-id` header: {}", v))?
-            .to_string())
+        tx: impl Serialize,
+    ) -> anyhow::Result<Response> {
+        self.alloc().await.send_transaction_no_bundle_only(tx).await
     }
 
-    /// Sends a transaction without `bundleOnly` flag, with lazy serialization.
-    pub async fn send_transaction_no_bundle_only_lazy<T>(
+    /// Sends multiple transactions as a bundle.
+    pub async fn send_bundle<T: IntoIterator<Item = impl Serialize>>(
         &self,
-        tx: impl Future<Output = anyhow::Result<T>>,
-    ) -> anyhow::Result<Response>
-    where
-        T: Serialize,
-    {
-        let (ref url, ref client) = *self.inner.lb.alloc().await;
-
-        let data = serialize_tx(tx.await?)?;
-
-        let body = &json!({
-            "id": 1,
-            "jsonrpc": "2.0",
-            "method": "sendTransaction",
-            "params": [
-                data, { "encoding": "base64" }
-            ]
-        });
-
-        if url.len() > 1 {
-            Ok(select_ok(url.iter().map(|v| {
-                Box::pin(async move {
-                    let (base, headers) = self.split_url(v)?;
-                    let full_url = format!("{}/api/v1/transactions", base);
-                    let response = client
-                        .post(&full_url)
-                        .headers(headers)
-                        .json(body)
-                        .send()
-                        .await?;
-
-                    if let Some(v) = self.inner.broadcast_status {
-                        if response.status() == v {
-                            Ok(response)
-                        } else {
-                            Err(anyhow!(
-                                "status code mismatch: expected {}, found {}",
-                                v,
-                                response.status()
-                            ))
-                        }
-                    } else {
-                        Ok(response)
-                    }
-                })
-            }))
-            .await?
-            .0)
-        } else {
-            let (base, headers) = self.split_url(&url[0])?;
-            let full_url = format!("{}/api/v1/transactions", base);
-            Ok(client
-                .post(&full_url)
-                .headers(headers)
-                .json(body)
-                .send()
-                .await?)
-        }
+        tx: T,
+    ) -> anyhow::Result<Response> {
+        self.alloc().await.send_bundle(tx).await
     }
 
-    /// Sends multiple transactions as a bundle, with lazy serialization.
-    pub async fn send_bundle_lazy<T, S>(
+    /// Sends a bundle and returns its bundle ID from the JSON response.
+    pub async fn send_bundle_bid<T: IntoIterator<Item = impl Serialize>>(
         &self,
-        tx: impl Future<Output = anyhow::Result<T>>,
-    ) -> anyhow::Result<Response>
-    where
-        T: IntoIterator<Item = S>,
-        S: Serialize,
-    {
-        let (ref url, ref client) = *self.inner.lb.alloc().await;
-
-        let data = serialize_tx_vec(tx.await?)?;
-
-        let body = &json!({
-            "id": 1,
-            "jsonrpc": "2.0",
-            "method": "sendBundle",
-            "params": [ data, { "encoding": "base64" } ]
-        });
-
-        if url.len() > 1 {
-            Ok(select_ok(url.iter().map(|v| {
-                Box::pin(async move {
-                    let (base, headers) = self.split_url(v)?;
-                    let full_url = format!("{}/api/v1/bundles", base);
-                    let response = client
-                        .post(&full_url)
-                        .headers(headers)
-                        .json(body)
-                        .send()
-                        .await?;
-
-                    if let Some(v) = self.inner.broadcast_status {
-                        if response.status() == v {
-                            Ok(response)
-                        } else {
-                            Err(anyhow!(
-                                "status code mismatch: expected {}, found {}",
-                                v,
-                                response.status()
-                            ))
-                        }
-                    } else {
-                        Ok(response)
-                    }
-                })
-            }))
-            .await?
-            .0)
-        } else {
-            let (base, headers) = self.split_url(&url[0])?;
-            let full_url = format!("{}/api/v1/bundles", base);
-            Ok(client
-                .post(&full_url)
-                .headers(headers)
-                .json(body)
-                .send()
-                .await?)
-        }
-    }
-
-    /// Sends a bundle and returns its bundle ID from the JSON response, with lazy serialization.
-    pub async fn send_bundle_bid_lazy<T, S>(
-        &self,
-        tx: impl Future<Output = anyhow::Result<T>>,
-    ) -> anyhow::Result<String>
-    where
-        T: IntoIterator<Item = S>,
-        S: Serialize,
-    {
-        self.send_bundle_lazy(tx)
-            .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await?["result"]
-            .as_str()
-            .map(|v| v.to_string())
-            .ok_or_else(|| anyhow::anyhow!("missing bundle result"))
-    }
-
-    /// Sends a single transaction and returns the HTTP response, with lazy serialization.
-    pub async fn send_transaction_lazy_fn<F, T>(&self, callback: F) -> anyhow::Result<Response>
-    where
-        F: AsyncFnOnce(&Vec<String>, &Client) -> anyhow::Result<T>,
-        T: Serialize,
-    {
-        let (ref url, ref client) = *self.inner.lb.alloc().await;
-
-        let data = serialize_tx(callback(url, client).await?)?;
-
-        let body = &json!({
-            "id": 1,
-            "jsonrpc": "2.0",
-            "method": "sendTransaction",
-            "params": [
-                data, { "encoding": "base64" }
-            ]
-        });
-
-        if url.len() > 1 {
-            Ok(select_ok(url.iter().map(|v| {
-                Box::pin(async move {
-                    let (base, headers) = self.split_url(v)?;
-                    let full_url = format!("{}/api/v1/transactions", base);
-                    let response = client
-                        .post(&full_url)
-                        .headers(headers)
-                        .query(&[("bundleOnly", "true")])
-                        .json(body)
-                        .send()
-                        .await?;
-
-                    if let Some(v) = self.inner.broadcast_status {
-                        if response.status() == v {
-                            Ok(response)
-                        } else {
-                            Err(anyhow!(
-                                "status code mismatch: expected {}, found {}",
-                                v,
-                                response.status()
-                            ))
-                        }
-                    } else {
-                        Ok(response)
-                    }
-                })
-            }))
-            .await?
-            .0)
-        } else {
-            let (base, headers) = self.split_url(&url[0])?;
-            let full_url = format!("{}/api/v1/transactions", base);
-            Ok(client
-                .post(&full_url)
-                .headers(headers)
-                .query(&[("bundleOnly", "true")])
-                .json(body)
-                .send()
-                .await?)
-        }
-    }
-
-    /// Sends a transaction and returns the bundle ID from the response headers, with lazy serialization.
-    pub async fn send_transaction_bid_lazy_fn<F, T>(&self, callback: F) -> anyhow::Result<String>
-    where
-        F: AsyncFnOnce(&Vec<String>, &Client) -> anyhow::Result<T>,
-        T: Serialize,
-    {
-        Ok(self
-            .send_transaction_lazy_fn(callback)
-            .await?
-            .error_for_status()?
-            .headers()
-            .get("x-bundle-id")
-            .ok_or_else(|| anyhow!("missing `x-bundle-id` header"))?
-            .to_str()
-            .map_err(|v| anyhow!("invalid `x-bundle-id` header: {}", v))?
-            .to_string())
-    }
-
-    /// Sends a transaction without `bundleOnly` flag, with lazy serialization.
-    pub async fn send_transaction_no_bundle_only_lazy_fn<F, T>(
-        &self,
-        callback: F,
-    ) -> anyhow::Result<Response>
-    where
-        F: AsyncFnOnce(&Vec<String>, &Client) -> anyhow::Result<T>,
-        T: Serialize,
-    {
-        let (ref url, ref client) = *self.inner.lb.alloc().await;
-
-        let data = serialize_tx(callback(url, client).await?)?;
-
-        let body = &json!({
-            "id": 1,
-            "jsonrpc": "2.0",
-            "method": "sendTransaction",
-            "params": [
-                data, { "encoding": "base64" }
-            ]
-        });
-
-        if url.len() > 1 {
-            Ok(select_ok(url.iter().map(|v| {
-                Box::pin(async move {
-                    let (base, headers) = self.split_url(v)?;
-                    let full_url = format!("{}/api/v1/transactions", base);
-                    let response = client
-                        .post(&full_url)
-                        .headers(headers)
-                        .json(body)
-                        .send()
-                        .await?;
-
-                    if let Some(v) = self.inner.broadcast_status {
-                        if response.status() == v {
-                            Ok(response)
-                        } else {
-                            Err(anyhow!(
-                                "status code mismatch: expected {}, found {}",
-                                v,
-                                response.status()
-                            ))
-                        }
-                    } else {
-                        Ok(response)
-                    }
-                })
-            }))
-            .await?
-            .0)
-        } else {
-            let (base, headers) = self.split_url(&url[0])?;
-            let full_url = format!("{}/api/v1/transactions", base);
-            Ok(client
-                .post(&full_url)
-                .headers(headers)
-                .json(body)
-                .send()
-                .await?)
-        }
-    }
-
-    /// Sends multiple transactions as a bundle, with lazy serialization.
-    pub async fn send_bundle_lazy_fn<F, T, S>(&self, callback: F) -> anyhow::Result<Response>
-    where
-        F: AsyncFnOnce(&Vec<String>, &Client) -> anyhow::Result<T>,
-        T: IntoIterator<Item = S>,
-        S: Serialize,
-    {
-        let (ref url, ref client) = *self.inner.lb.alloc().await;
-
-        let data = serialize_tx_vec(callback(url, client).await?)?;
-
-        let body = &json!({
-            "id": 1,
-            "jsonrpc": "2.0",
-            "method": "sendBundle",
-            "params": [ data, { "encoding": "base64" } ]
-        });
-
-        if url.len() > 1 {
-            Ok(select_ok(url.iter().map(|v| {
-                Box::pin(async move {
-                    let (base, headers) = self.split_url(v)?;
-                    let full_url = format!("{}/api/v1/bundles", base);
-                    let response = client
-                        .post(&full_url)
-                        .headers(headers)
-                        .json(body)
-                        .send()
-                        .await?;
-
-                    if let Some(v) = self.inner.broadcast_status {
-                        if response.status() == v {
-                            Ok(response)
-                        } else {
-                            Err(anyhow!(
-                                "status code mismatch: expected {}, found {}",
-                                v,
-                                response.status()
-                            ))
-                        }
-                    } else {
-                        Ok(response)
-                    }
-                })
-            }))
-            .await?
-            .0)
-        } else {
-            let (base, headers) = self.split_url(&url[0])?;
-            let full_url = format!("{}/api/v1/bundles", base);
-            Ok(client
-                .post(&full_url)
-                .headers(headers)
-                .json(body)
-                .send()
-                .await?)
-        }
-    }
-
-    /// Sends a bundle and returns its bundle ID from the JSON response, with lazy serialization.
-    pub async fn send_bundle_bid_lazy_fn<F, T, S>(&self, callback: F) -> anyhow::Result<String>
-    where
-        F: AsyncFnOnce(&Vec<String>, &Client) -> anyhow::Result<T>,
-        T: IntoIterator<Item = S>,
-        S: Serialize,
-    {
-        self.send_bundle_lazy_fn(callback)
-            .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await?["result"]
-            .as_str()
-            .map(|v| v.to_string())
-            .ok_or_else(|| anyhow::anyhow!("missing bundle result"))
-    }
-
-    /// Spawns a new asynchronous task that respects the internal semaphore.
-    ///
-    /// The task will only start executing once a permit is acquired from the semaphore.
-    /// When the task completes, the permit is automatically released.
-    pub async fn spawn<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
-    where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        let permit = self.inner.semaphore.clone().acquire_owned().await.unwrap();
-
-        spawn(async move {
-            let result = future.await;
-
-            drop(permit);
-
-            result
-        })
-    }
-
-    fn split_url<'a>(&'a self, url: &'a str) -> anyhow::Result<(&'a str, HeaderMap)> {
-        let mut headers = HeaderMap::new();
-
-        if let Some(v) = &self.inner.headers_with_separator {
-            if let Some((a, b)) = url.split_once(v) {
-                for (k, v) in form_urlencoded::parse(b.as_bytes()) {
-                    headers.insert(HeaderName::from_bytes(k.as_bytes())?, v.parse()?);
-                }
-
-                return Ok((a, headers));
-            }
-        }
-
-        Ok((url, headers))
+        tx: T,
+    ) -> anyhow::Result<String> {
+        self.alloc().await.send_bundle_bid(tx).await
     }
 }
 
