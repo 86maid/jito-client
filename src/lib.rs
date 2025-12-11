@@ -247,6 +247,14 @@ impl JitoClientOnce {
         Ok((url, headers))
     }
 
+    pub fn url(&self) -> &Vec<String> {
+        &self.entry.0
+    }
+
+    pub fn client(&self) -> &Client {
+        &self.entry.1
+    }
+
     /// Sends a raw request.
     pub async fn raw_send(&self, body: &Value) -> anyhow::Result<Response> {
         let (ref url, ref client) = *self.entry;
