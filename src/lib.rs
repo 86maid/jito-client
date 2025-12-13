@@ -560,6 +560,14 @@ impl JitoClient {
         }
     }
 
+    // Try alloc a new client with Load Balancer.
+    pub fn try_alloc(&self) -> Option<JitoClientOnce> {
+        Some(JitoClientOnce {
+            inner: self.inner.clone(),
+            entry: self.inner.lb.try_alloc()?,
+        })
+    }
+
     /// Sends a raw request.
     pub async fn raw_send(&self, body: &Value) -> anyhow::Result<Response> {
         self.alloc().await.raw_send(body).await
