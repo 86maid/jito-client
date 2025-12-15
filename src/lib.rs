@@ -1,7 +1,7 @@
 use anyhow::{Context, anyhow};
 use base64::prelude::*;
 use futures::future::{join_all, select_ok};
-use load_balancer::{LoadBalancer, interval::IntervalLoadBalancer};
+use load_balancer::{LoadBalancer, time::TimeLoadBalancer};
 use reqwest::header::HeaderName;
 use reqwest::{Client, ClientBuilder, Response};
 use serde::{Deserialize, Serialize};
@@ -150,7 +150,7 @@ impl JitoClientBuilder {
             }
 
             JitoClientRef {
-                lb: IntervalLoadBalancer::new(entries),
+                lb: TimeLoadBalancer::new(entries),
                 broadcast_status: self.broadcast_status,
                 headers_with_separator: self.headers_with_separator,
             }
@@ -200,7 +200,7 @@ impl JitoClientBuilder {
             }
 
             JitoClientRef {
-                lb: IntervalLoadBalancer::new(entries),
+                lb: TimeLoadBalancer::new(entries),
                 broadcast_status: self.broadcast_status,
                 headers_with_separator: self.headers_with_separator,
             }
@@ -213,7 +213,7 @@ impl JitoClientBuilder {
 }
 
 struct JitoClientRef {
-    lb: IntervalLoadBalancer<Arc<(Vec<String>, Client)>>,
+    lb: TimeLoadBalancer<Arc<(Vec<String>, Client)>>,
     broadcast_status: Option<StatusCode>,
     headers_with_separator: Option<String>,
 }
