@@ -766,21 +766,39 @@ pub async fn test_ip(ip: IpAddr) -> anyhow::Result<IpAddr> {
 
 pub async fn test_all_ip() -> Vec<anyhow::Result<IpAddr>> {
     match get_ip_list() {
-        Ok(v) => join_all(v.into_iter().map(|v| test_ip(v))).await,
+        Ok(v) => {
+            join_all(
+                v.into_iter()
+                    .map(|v| async move { test_ip(v).await.context(v) }),
+            )
+            .await
+        }
         Err(_) => Vec::new(),
     }
 }
 
 pub async fn test_all_ipv4() -> Vec<anyhow::Result<IpAddr>> {
     match get_ipv4_list() {
-        Ok(v) => join_all(v.into_iter().map(|v| test_ip(v))).await,
+        Ok(v) => {
+            join_all(
+                v.into_iter()
+                    .map(|v| async move { test_ip(v).await.context(v) }),
+            )
+            .await
+        }
         Err(_) => Vec::new(),
     }
 }
 
 pub async fn test_all_ipv6() -> Vec<anyhow::Result<IpAddr>> {
     match get_ipv6_list() {
-        Ok(v) => join_all(v.into_iter().map(|v| test_ip(v))).await,
+        Ok(v) => {
+            join_all(
+                v.into_iter()
+                    .map(|v| async move { test_ip(v).await.context(v) }),
+            )
+            .await
+        }
         Err(_) => Vec::new(),
     }
 }
