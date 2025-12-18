@@ -1,4 +1,4 @@
-use anyhow::{Context, anyhow};
+use anyhow::{Context, anyhow, bail};
 use base64::prelude::*;
 use futures::future::{join_all, select_ok};
 use load_balancer::{LoadBalancer, time::TimeLoadBalancer};
@@ -26,7 +26,8 @@ pub struct JitoClientBuilder {
     headers: Option<HeaderMap>,
     ip: Vec<IpAddr>,
     headers_with_separator: Option<String>,
-    broadcast_status: Option<StatusCode>,
+    error_read_headers: bool,
+    error_read_body: bool,
 }
 
 impl JitoClientBuilder {
@@ -41,7 +42,8 @@ impl JitoClientBuilder {
             headers: None,
             ip: Vec::new(),
             headers_with_separator: None,
-            broadcast_status: None,
+            error_read_headers: false,
+            error_read_body: false,
         }
     }
 
@@ -88,9 +90,15 @@ impl JitoClientBuilder {
         self
     }
 
-    /// Sets the status code considered successful in broadcast mode for select_ok.
-    pub fn broadcast_status(mut self, broadcast_status: StatusCode) -> Self {
-        self.broadcast_status = Some(broadcast_status);
+    /// Whether to include HTTP response headers in error messages when the request fails.
+    pub fn error_read_headers(mut self, error_read_headers: bool) -> Self {
+        self.error_read_headers = error_read_headers;
+        self
+    }
+
+    /// Whether to include HTTP response body in error messages when the request fails.
+    pub fn error_read_body(mut self, error_read_body: bool) -> Self {
+        self.error_read_body = error_read_body;
         self
     }
 
@@ -126,7 +134,10 @@ impl JitoClientBuilder {
                     cb = cb.default_headers(v);
                 }
 
-                entries.push((self.interval, Arc::new((self.url.clone(), cb.build()?))));
+                entries.push((
+                    self.interval,
+                    Arc::new((self.url.clone(), cb.build()?, "127.0.0.1".parse()?)),
+                ));
             } else {
                 for ip in &self.ip {
                     let mut cb = ClientBuilder::new();
@@ -145,13 +156,17 @@ impl JitoClientBuilder {
 
                     cb = cb.local_address(*ip);
 
-                    entries.push((self.interval, Arc::new((self.url.clone(), cb.build()?))));
+                    entries.push((
+                        self.interval,
+                        Arc::new((self.url.clone(), cb.build()?, *ip)),
+                    ));
                 }
             }
 
             JitoClientRef {
                 lb: TimeLoadBalancer::new(entries),
-                broadcast_status: self.broadcast_status,
+                error_read_body: self.error_read_body,
+                error_read_headers: self.error_read_headers,
                 headers_with_separator: self.headers_with_separator,
             }
         } else {
@@ -173,7 +188,10 @@ impl JitoClientBuilder {
                         cb = cb.default_headers(v);
                     }
 
-                    entries.push((self.interval, Arc::new((vec![url.clone()], cb.build()?))));
+                    entries.push((
+                        self.interval,
+                        Arc::new((vec![url.clone()], cb.build()?, "127.0.0.1".parse()?)),
+                    ));
                 }
             } else {
                 for url in &self.url {
@@ -194,14 +212,18 @@ impl JitoClientBuilder {
 
                         cb = cb.local_address(*ip);
 
-                        entries.push((self.interval, Arc::new((vec![url.clone()], cb.build()?))));
+                        entries.push((
+                            self.interval,
+                            Arc::new((vec![url.clone()], cb.build()?, *ip)),
+                        ));
                     }
                 }
             }
 
             JitoClientRef {
                 lb: TimeLoadBalancer::new(entries),
-                broadcast_status: self.broadcast_status,
+                error_read_body: self.error_read_body,
+                error_read_headers: self.error_read_headers,
                 headers_with_separator: self.headers_with_separator,
             }
         };
@@ -212,9 +234,15 @@ impl JitoClientBuilder {
     }
 }
 
+/// (url, client, ip)
+///
+/// If `url.len() > 1`, the request is broadcast.
+pub type Entry = (Vec<String>, Client, IpAddr);
+
 struct JitoClientRef {
-    lb: TimeLoadBalancer<Arc<(Vec<String>, Client)>>,
-    broadcast_status: Option<StatusCode>,
+    lb: TimeLoadBalancer<Arc<Entry>>,
+    error_read_body: bool,
+    error_read_headers: bool,
     headers_with_separator: Option<String>,
 }
 
@@ -227,10 +255,37 @@ pub struct JitoClient {
 #[derive(Clone)]
 pub struct JitoClientOnce {
     inner: Arc<JitoClientRef>,
-    entry: Arc<(Vec<String>, Client)>,
+    entry: Arc<Entry>,
 }
 
 impl JitoClientOnce {
+    async fn handle_response(&self, response: Response) -> anyhow::Result<Response> {
+        if response.status().is_success() {
+            return Ok(response);
+        }
+
+        let status = response.status();
+
+        let headers = if self.inner.error_read_headers {
+            format!("{:#?}", response.headers())
+        } else {
+            String::new()
+        };
+
+        let body = if self.inner.error_read_body {
+            response.text().await.unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        match (self.inner.error_read_headers, self.inner.error_read_body) {
+            (true, true) => bail!("{}\n{}\n{}", status, headers, body),
+            (true, false) => bail!("{}\n{}", status, headers),
+            (false, true) => bail!("{}\n{}", status, body),
+            (false, false) => bail!("{}", status),
+        }
+    }
+
     fn split_url<'a>(&'a self, url: &'a str) -> anyhow::Result<(&'a str, HeaderMap)> {
         let mut headers = HeaderMap::new();
 
@@ -247,45 +302,31 @@ impl JitoClientOnce {
         Ok((url, headers))
     }
 
-    pub fn url(&self) -> &Vec<String> {
-        &self.entry.0
-    }
-
-    pub fn client(&self) -> &Client {
-        &self.entry.1
+    pub fn entry(&self) -> Arc<Entry> {
+        self.entry.clone()
     }
 
     /// Sends a raw request.
     pub async fn raw_send(&self, body: &Value) -> anyhow::Result<Response> {
-        let (ref url, ref client) = *self.entry;
+        let (ref url, ref client, ..) = *self.entry;
 
         if url.len() > 1 {
             Ok(select_ok(url.iter().map(|v| {
                 Box::pin(async move {
                     let (url, headers) = self.split_url(v)?;
                     let response = client.post(url).headers(headers).json(&body).send().await?;
+                    let response = self.handle_response(response).await?;
 
-                    if let Some(v) = self.inner.broadcast_status {
-                        if response.status() == v {
-                            Ok(response)
-                        } else {
-                            Err(anyhow!(
-                                "status code mismatch: expected {}, found {}",
-                                v,
-                                response.status()
-                            ))
-                        }
-                    } else {
-                        Ok(response)
-                    }
+                    anyhow::Ok(response)
                 })
             }))
             .await?
             .0)
         } else {
             let (url, headers) = self.split_url(&url[0])?;
+            let response = client.post(url).headers(headers).json(body).send().await?;
 
-            Ok(client.post(url).headers(headers).json(body).send().await?)
+            self.handle_response(response).await
         }
     }
 
@@ -295,48 +336,41 @@ impl JitoClientOnce {
         api_url: impl AsRef<str>,
         body: &Value,
     ) -> anyhow::Result<Response> {
-        let (ref url, ref client) = *self.entry;
+        let (ref url, ref client, ..) = *self.entry;
         let api_url = api_url.as_ref();
 
         if url.len() > 1 {
             Ok(select_ok(url.iter().map(|v| {
                 Box::pin(async move {
                     let (base, headers) = self.split_url(v)?;
-                    let full_url = format!("{}{}", base, api_url);
-                    let response = client
-                        .post(&full_url)
-                        .headers(headers)
-                        .json(&body)
-                        .send()
-                        .await?;
 
-                    if let Some(v) = self.inner.broadcast_status {
-                        if response.status() == v {
-                            Ok(response)
-                        } else {
-                            Err(anyhow!(
-                                "status code mismatch: expected {}, found {}",
-                                v,
-                                response.status()
-                            ))
-                        }
-                    } else {
-                        Ok(response)
-                    }
+                    anyhow::Ok(
+                        self.handle_response(
+                            client
+                                .post(&format!("{}{}", base, api_url))
+                                .headers(headers)
+                                .json(&body)
+                                .send()
+                                .await?,
+                        )
+                        .await?,
+                    )
                 })
             }))
             .await?
             .0)
         } else {
             let (base, headers) = self.split_url(&url[0])?;
-            let full_url = format!("{}{}", base, api_url);
 
-            Ok(client
-                .post(&full_url)
-                .headers(headers)
-                .json(body)
-                .send()
-                .await?)
+            self.handle_response(
+                client
+                    .post(&format!("{}{}", base, api_url))
+                    .headers(headers)
+                    .json(body)
+                    .send()
+                    .await?,
+            )
+            .await
         }
     }
 
@@ -353,58 +387,49 @@ impl JitoClientOnce {
             ]
         });
 
-        let (ref url, ref client) = *self.entry;
+        let (ref url, ref client, ..) = *self.entry;
 
         if url.len() > 1 {
             Ok(select_ok(url.iter().map(|v| {
                 Box::pin(async move {
                     let (base, headers) = self.split_url(v)?;
-                    let full_url = format!("{}/api/v1/transactions", base);
-                    let response = client
-                        .post(&full_url)
-                        .headers(headers)
-                        .query(&[("bundleOnly", "true")])
-                        .json(body)
-                        .send()
-                        .await?;
 
-                    if let Some(v) = self.inner.broadcast_status {
-                        if response.status() == v {
-                            Ok(response)
-                        } else {
-                            Err(anyhow!(
-                                "status code mismatch: expected {}, found {}",
-                                v,
-                                response.status()
-                            ))
-                        }
-                    } else {
-                        Ok(response)
-                    }
+                    anyhow::Ok(
+                        self.handle_response(
+                            client
+                                .post(&format!("{}/api/v1/transactions", base))
+                                .headers(headers)
+                                .query(&[("bundleOnly", "true")])
+                                .json(body)
+                                .send()
+                                .await?,
+                        )
+                        .await?,
+                    )
                 })
             }))
             .await?
             .0)
         } else {
             let (base, headers) = self.split_url(&url[0])?;
-            let full_url = format!("{}/api/v1/transactions", base);
 
-            Ok(client
-                .post(&full_url)
+            let response = client
+                .post(&format!("{}/api/v1/transactions", base))
                 .headers(headers)
                 .query(&[("bundleOnly", "true")])
                 .json(body)
                 .send()
-                .await?)
+                .await?;
+
+            self.handle_response(response).await
         }
     }
 
     /// Sends a transaction and returns the bundle ID from the response headers.
     pub async fn send_transaction_bid(&self, tx: impl Serialize) -> anyhow::Result<String> {
-        Ok(self
-            .send_transaction(tx)
-            .await?
-            .error_for_status()?
+        let response = self.send_transaction(tx).await?;
+
+        Ok(response
             .headers()
             .get("x-bundle-id")
             .ok_or_else(|| anyhow!("missing `x-bundle-id` header"))?
@@ -428,47 +453,40 @@ impl JitoClientOnce {
             ]
         });
 
-        let (ref url, ref client) = *self.entry;
+        let (ref url, ref client, ..) = *self.entry;
 
         if url.len() > 1 {
             Ok(select_ok(url.iter().map(|v| {
                 Box::pin(async move {
                     let (base, headers) = self.split_url(v)?;
-                    let full_url = format!("{}/api/v1/transactions", base);
-                    let response = client
-                        .post(&full_url)
-                        .headers(headers)
-                        .json(body)
-                        .send()
-                        .await?;
 
-                    if let Some(v) = self.inner.broadcast_status {
-                        if response.status() == v {
-                            Ok(response)
-                        } else {
-                            Err(anyhow!(
-                                "status code mismatch: expected {}, found {}",
-                                v,
-                                response.status()
-                            ))
-                        }
-                    } else {
-                        Ok(response)
-                    }
+                    anyhow::Ok(
+                        self.handle_response(
+                            client
+                                .post(&format!("{}/api/v1/transactions", base))
+                                .headers(headers)
+                                .json(body)
+                                .send()
+                                .await?,
+                        )
+                        .await?,
+                    )
                 })
             }))
             .await?
             .0)
         } else {
             let (base, headers) = self.split_url(&url[0])?;
-            let full_url = format!("{}/api/v1/transactions", base);
 
-            Ok(client
-                .post(&full_url)
-                .headers(headers)
-                .json(body)
-                .send()
-                .await?)
+            self.handle_response(
+                client
+                    .post(&format!("{}/api/v1/transactions", base))
+                    .headers(headers)
+                    .json(body)
+                    .send()
+                    .await?,
+            )
+            .await
         }
     }
 
@@ -486,47 +504,40 @@ impl JitoClientOnce {
             "params": [ data, { "encoding": "base64" } ]
         });
 
-        let (ref url, ref client) = *self.entry;
+        let (ref url, ref client, ..) = *self.entry;
 
         if url.len() > 1 {
             Ok(select_ok(url.iter().map(|v| {
                 Box::pin(async move {
                     let (base, headers) = self.split_url(v)?;
-                    let full_url = format!("{}/api/v1/bundles", base);
-                    let response = client
-                        .post(&full_url)
-                        .headers(headers)
-                        .json(body)
-                        .send()
-                        .await?;
 
-                    if let Some(v) = self.inner.broadcast_status {
-                        if response.status() == v {
-                            Ok(response)
-                        } else {
-                            Err(anyhow!(
-                                "status code mismatch: expected {}, found {}",
-                                v,
-                                response.status()
-                            ))
-                        }
-                    } else {
-                        Ok(response)
-                    }
+                    anyhow::Ok(
+                        self.handle_response(
+                            client
+                                .post(&format!("{}/api/v1/bundles", base))
+                                .headers(headers)
+                                .json(body)
+                                .send()
+                                .await?,
+                        )
+                        .await?,
+                    )
                 })
             }))
             .await?
             .0)
         } else {
             let (base, headers) = self.split_url(&url[0])?;
-            let full_url = format!("{}/api/v1/bundles", base);
 
-            Ok(client
-                .post(&full_url)
-                .headers(headers)
-                .json(body)
-                .send()
-                .await?)
+            self.handle_response(
+                client
+                    .post(&format!("{}/api/v1/bundles", base))
+                    .headers(headers)
+                    .json(body)
+                    .send()
+                    .await?,
+            )
+            .await
         }
     }
 

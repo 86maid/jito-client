@@ -64,7 +64,6 @@ async fn main() -> anyhow::Result<()> {
     // If you have 1 IP  → max 5 req/sec (5 req/s * 1 IP)
     let client = JitoClientBuilder::new()
         .broadcast(true)
-        .broadcast_status(StatusCode::OK)            // select OK response
         .interval(Duration::from_millis(200))        // 5 req/s per IP
         .ip(get_ipv4_list()?)
         .url(&[
