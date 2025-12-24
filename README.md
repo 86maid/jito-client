@@ -1,6 +1,6 @@
-# Jito Client — High-Performance Rust Client (Refactored)
+# Jito Client — High-Performance Rust Client
 
-A fast, async Rust client for Jito Block-Engine with built-in **per-IP rate limiting**, **multi-IP binding**, **broadcast mode**, and **flexible header injection**.
+A fast, async Rust client for Jito Block-Engine with built-in per-IP rate limiting, multi-IP binding, broadcast mode, and flexible header injection.
 
 ## Features
 
@@ -9,8 +9,7 @@ A fast, async Rust client for Jito Block-Engine with built-in **per-IP rate limi
 - **Broadcast mode** — fire the same request to all endpoints simultaneously
 - Bind to multiple local IPv4/IPv6 addresses (bypass IP-based limits)
 - Proxy, timeout, custom headers, auth-key via URL
-- Header injection directly in URL (e.g. `https://ny.mainnet...:auth=secret`)
-- Zero-cost `alloc()` for high concurrency while respecting limits
+- Header injection directly in URL (e.g. `https://ny.mainnet...~auth=secret`)
 - Helper functions: tip floor, bundle status, inflight status, etc.
 
 # Quick Start
@@ -39,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-# Advanced Configuration (Builder)
+# Advanced Configuration
 
 ```rust
 use jito_client::*;
