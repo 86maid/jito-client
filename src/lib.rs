@@ -376,7 +376,7 @@ impl JitoClientOnce {
 
     /// Sends a single transaction and returns the HTTP response.
     pub async fn send_transaction(&self, tx: impl Serialize) -> anyhow::Result<Response> {
-        let data = serialize_tx(tx)?;
+        let data = serialize_tx_checked(tx)?;
 
         let body = &json!({
             "id": 1,
@@ -443,7 +443,7 @@ impl JitoClientOnce {
         &self,
         tx: impl Serialize,
     ) -> anyhow::Result<Response> {
-        let data = serialize_tx(tx)?;
+        let data = serialize_tx_checked(tx)?;
         let body = &json!({
             "id": 1,
             "jsonrpc": "2.0",
@@ -495,7 +495,7 @@ impl JitoClientOnce {
         &self,
         tx: T,
     ) -> anyhow::Result<Response> {
-        let data = serialize_tx_vec(tx)?;
+        let data = serialize_tx_vec_checked(tx)?;
 
         let body = &json!({
             "id": 1,
@@ -547,6 +547,191 @@ impl JitoClientOnce {
         tx: T,
     ) -> anyhow::Result<String> {
         self.send_bundle(tx)
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?["result"]
+            .as_str()
+            .map(|v| v.to_string())
+            .ok_or_else(|| anyhow::anyhow!("missing bundle result"))
+    }
+
+    /// Sends a single transaction with pre-serialized data and returns the HTTP response.
+    pub async fn send_transaction_str(&self, tx: impl AsRef<str>) -> anyhow::Result<Response> {
+        let data = tx.as_ref();
+
+        let body = &json!({
+            "id": 1,
+            "jsonrpc": "2.0",
+            "method": "sendTransaction",
+            "params": [
+                data, { "encoding": "base64" }
+            ]
+        });
+
+        let (ref url, ref client, ..) = *self.entry;
+
+        if url.len() > 1 {
+            Ok(select_ok(url.iter().map(|v| {
+                Box::pin(async move {
+                    let (base, headers) = self.split_url(v)?;
+
+                    anyhow::Ok(
+                        self.handle_response(
+                            client
+                                .post(&format!("{}/api/v1/transactions", base))
+                                .headers(headers)
+                                .query(&[("bundleOnly", "true")])
+                                .json(body)
+                                .send()
+                                .await?,
+                        )
+                        .await?,
+                    )
+                })
+            }))
+            .await?
+            .0)
+        } else {
+            let (base, headers) = self.split_url(&url[0])?;
+
+            let response = client
+                .post(&format!("{}/api/v1/transactions", base))
+                .headers(headers)
+                .query(&[("bundleOnly", "true")])
+                .json(body)
+                .send()
+                .await?;
+
+            self.handle_response(response).await
+        }
+    }
+
+    /// Sends a transaction with pre-serialized data and returns the bundle ID from the response headers.
+    pub async fn send_transaction_bid_str(&self, tx: impl AsRef<str>) -> anyhow::Result<String> {
+        let response = self.send_transaction_str(tx).await?;
+
+        Ok(response
+            .headers()
+            .get("x-bundle-id")
+            .ok_or_else(|| anyhow!("missing `x-bundle-id` header"))?
+            .to_str()
+            .map_err(|v| anyhow!("invalid `x-bundle-id` header: {}", v))?
+            .to_string())
+    }
+
+    /// Sends a transaction with pre-serialized data without `bundleOnly` flag.
+    pub async fn send_transaction_no_bundle_only_str(
+        &self,
+        tx: impl AsRef<str>,
+    ) -> anyhow::Result<Response> {
+        let data = tx.as_ref();
+        let body = &json!({
+            "id": 1,
+            "jsonrpc": "2.0",
+            "method": "sendTransaction",
+            "params": [
+                data, { "encoding": "base64" }
+            ]
+        });
+
+        let (ref url, ref client, ..) = *self.entry;
+
+        if url.len() > 1 {
+            Ok(select_ok(url.iter().map(|v| {
+                Box::pin(async move {
+                    let (base, headers) = self.split_url(v)?;
+
+                    anyhow::Ok(
+                        self.handle_response(
+                            client
+                                .post(&format!("{}/api/v1/transactions", base))
+                                .headers(headers)
+                                .json(body)
+                                .send()
+                                .await?,
+                        )
+                        .await?,
+                    )
+                })
+            }))
+            .await?
+            .0)
+        } else {
+            let (base, headers) = self.split_url(&url[0])?;
+
+            self.handle_response(
+                client
+                    .post(&format!("{}/api/v1/transactions", base))
+                    .headers(headers)
+                    .json(body)
+                    .send()
+                    .await?,
+            )
+            .await
+        }
+    }
+
+    /// Sends multiple pre-serialized transactions as a bundle.
+    pub async fn send_bundle_str<T: IntoIterator<Item = impl AsRef<str>>>(
+        &self,
+        tx: T,
+    ) -> anyhow::Result<Response> {
+        let data = tx
+            .into_iter()
+            .map(|x| x.as_ref().to_string())
+            .collect::<Vec<String>>();
+
+        let body = &json!({
+            "id": 1,
+            "jsonrpc": "2.0",
+            "method": "sendBundle",
+            "params": [ data, { "encoding": "base64" } ]
+        });
+
+        let (ref url, ref client, ..) = *self.entry;
+
+        if url.len() > 1 {
+            Ok(select_ok(url.iter().map(|v| {
+                Box::pin(async move {
+                    let (base, headers) = self.split_url(v)?;
+
+                    anyhow::Ok(
+                        self.handle_response(
+                            client
+                                .post(&format!("{}/api/v1/bundles", base))
+                                .headers(headers)
+                                .json(body)
+                                .send()
+                                .await?,
+                        )
+                        .await?,
+                    )
+                })
+            }))
+            .await?
+            .0)
+        } else {
+            let (base, headers) = self.split_url(&url[0])?;
+
+            self.handle_response(
+                client
+                    .post(&format!("{}/api/v1/bundles", base))
+                    .headers(headers)
+                    .json(body)
+                    .send()
+                    .await?,
+            )
+            .await
+        }
+    }
+
+    /// Sends a bundle with pre-serialized data and returns its bundle ID from the JSON response.
+    pub async fn send_bundle_bid_str<T: IntoIterator<Item = impl AsRef<str>>>(
+        &self,
+        tx: T,
+    ) -> anyhow::Result<String> {
+        self.send_bundle_str(tx)
             .await?
             .error_for_status()?
             .json::<Value>()
@@ -625,6 +810,43 @@ impl JitoClient {
         tx: T,
     ) -> anyhow::Result<String> {
         self.alloc().await.send_bundle_bid(tx).await
+    }
+
+    /// Sends a single transaction with pre-serialized data and returns the HTTP response.
+    pub async fn send_transaction_str(&self, tx: impl AsRef<str>) -> anyhow::Result<Response> {
+        self.alloc().await.send_transaction_str(tx).await
+    }
+
+    /// Sends a transaction with pre-serialized data and returns the bundle ID from the response headers.
+    pub async fn send_transaction_bid_str(&self, tx: impl AsRef<str>) -> anyhow::Result<String> {
+        self.alloc().await.send_transaction_bid_str(tx).await
+    }
+
+    /// Sends a transaction with pre-serialized data without `bundleOnly` flag.
+    pub async fn send_transaction_no_bundle_only_str(
+        &self,
+        tx: impl AsRef<str>,
+    ) -> anyhow::Result<Response> {
+        self.alloc()
+            .await
+            .send_transaction_no_bundle_only_str(tx)
+            .await
+    }
+
+    /// Sends multiple pre-serialized transactions as a bundle.
+    pub async fn send_bundle_str<T: IntoIterator<Item = impl AsRef<str>>>(
+        &self,
+        tx: T,
+    ) -> anyhow::Result<Response> {
+        self.alloc().await.send_bundle_str(tx).await
+    }
+
+    /// Sends a bundle with pre-serialized data and returns its bundle ID from the JSON response.
+    pub async fn send_bundle_bid_str<T: IntoIterator<Item = impl AsRef<str>>>(
+        &self,
+        tx: T,
+    ) -> anyhow::Result<String> {
+        self.alloc().await.send_bundle_bid_str(tx).await
     }
 }
 
@@ -824,4 +1046,28 @@ pub fn serialize_tx_vec<T: IntoIterator<Item = impl Serialize>>(
     tx.into_iter()
         .map(|tx| Ok(BASE64_STANDARD.encode(bincode::serialize(&tx)?)))
         .collect::<anyhow::Result<Vec<_>>>()
+}
+
+pub fn serialize_tx_checked(tx: impl Serialize) -> anyhow::Result<String> {
+    let data = bincode::serialize(&tx)?;
+
+    anyhow::ensure!(data.len() <= 1232);
+
+    Ok(BASE64_STANDARD.encode(data))
+}
+
+pub fn serialize_tx_vec_checked<T: IntoIterator<Item = impl Serialize>>(
+    tx: T,
+) -> anyhow::Result<Vec<String>> {
+    let mut result = Vec::new();
+
+    for i in tx.into_iter() {
+        let data = bincode::serialize(&i)?;
+
+        anyhow::ensure!(data.len() <= 1232);
+
+        result.push(BASE64_STANDARD.encode(data));
+    }
+
+    Ok(result)
 }
